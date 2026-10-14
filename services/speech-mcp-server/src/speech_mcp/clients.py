@@ -91,7 +91,10 @@ class Peers:
             await c.close()
 
     async def open(self, p, project_id, revision_id=None, write=False):
-        args = {"project_id": project_id, "require_write": write}
+        args = {"project_id": project_id}
+        # Project strict JSON rejects explicit zero values for omitempty fields.
+        if write:
+            args["require_write"] = True
         if revision_id:
             args["revision_id"] = revision_id
         result = await self.project.json(p, "POST", "/internal/v1/project/open", args)

@@ -188,5 +188,18 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen, ["https://internal.test/health"])
         await c.close()
 
+    async def test_project_read_omits_empty_optional_write_flag(self):
+        def handler(request):
+            body = strict_json(request.content)
+            if body.get("require_write") is False:
+                return httpx.Response(400, json={"code": "INVALID_ARGUMENT"})
+            return httpx.Response(200, json={"manifest": {"files": []}})
+        c = Client("https://internal.test", "secret", transport=httpx.MockTransport(handler))
+        peers = Peers(c, None, None)
+        for write in (False, True):
+            result = await peers.open(self.p, self.req["project_id"], write=write)
+            self.assertEqual(result, {"manifest": {"files": []}})
+        await c.close()
+
 
 if __name__ == "__main__": unittest.main()
