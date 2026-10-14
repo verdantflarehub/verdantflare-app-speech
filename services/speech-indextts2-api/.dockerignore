@@ -1,0 +1,14 @@
+*
+!Dockerfile
+!pyproject.toml
+!engine-environment.toml
+!engine.uv.lock
+!upstream.lock.json
+!src/
+!src/**
+!scripts/
+!scripts/prepare_source.py
+!models/
+!models/manifest.lock.json
+**/__pycache__
+**/*.pyc

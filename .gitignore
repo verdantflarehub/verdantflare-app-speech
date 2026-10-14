@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.env*
+*.wav
+*.m4a
+*.mp3
+*.pth
+*.pt
+*.safetensors
+*.index
+data/
+checkpoints/

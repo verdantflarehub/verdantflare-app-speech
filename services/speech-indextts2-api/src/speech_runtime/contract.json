@@ -1,0 +1,416 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "station://contracts/drafts/speech-runtime-v1",
+  "title": "SpeechRuntimeV1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/create"
+    },
+    {
+      "$ref": "#/$defs/voice_profile"
+    },
+    {
+      "$ref": "#/$defs/task"
+    },
+    {
+      "$ref": "#/$defs/error"
+    },
+    {
+      "$ref": "#/$defs/audio_report"
+    }
+  ],
+  "$defs": {
+    "create": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "idempotency_key",
+        "text",
+        "reference_sha256",
+        "language"
+      ],
+      "properties": {
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "reference_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "language": {
+          "const": "zh-CN"
+        },
+        "emotion_vector": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "items": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "target_duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 180
+        }
+      },
+      "description": "Target duration is advisory only; emotion sum <= 0.8 and nonblank text are runtime invariants."
+    },
+    "voice_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "voice_id",
+        "version",
+        "display_name",
+        "language",
+        "engine",
+        "model_manifest_sha256",
+        "reference",
+        "reference_sha256",
+        "recorded_text"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "0.1-draft"
+        },
+        "kind": {
+          "const": "speech_voice_profile"
+        },
+        "voice_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "language": {
+          "const": "zh-CN"
+        },
+        "engine": {
+          "const": "indextts2"
+        },
+        "model_manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "reference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "store_id",
+            "artifact_id",
+            "version_id"
+          ],
+          "properties": {
+            "store_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            },
+            "artifact_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            },
+            "version_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          }
+        },
+        "reference_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "recorded_text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "source_reference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "store_id",
+            "artifact_id",
+            "version_id"
+          ],
+          "properties": {
+            "store_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            },
+            "artifact_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            },
+            "version_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          }
+        },
+        "trim_start_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "trim_end_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1000
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "enum": [
+            "original.wav",
+            "editing.wav",
+            "report.json"
+          ]
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mime": {
+          "enum": [
+            "audio/wav",
+            "application/json"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "sha256",
+        "size",
+        "mime"
+      ]
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "running",
+            "succeeded",
+            "failed"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "model_manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]*$"
+            },
+            "recovery_required": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "recovery_required"
+          ]
+        },
+        "outputs": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/output"
+          }
+        }
+      },
+      "required": [
+        "task_id",
+        "status",
+        "created_at",
+        "updated_at",
+        "model_manifest_sha256"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "succeeded"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "outputs"
+            ],
+            "not": {
+              "required": [
+                "error"
+              ]
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "outputs"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "error"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]*$"
+            },
+            "request_id": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "code"
+          ]
+        }
+      },
+      "required": [
+        "error"
+      ]
+    },
+    "audio_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sample_rate_hz": {
+          "enum": [
+            16000,
+            22050,
+            24000,
+            44100,
+            48000
+          ]
+        },
+        "channels": {
+          "const": 1
+        },
+        "bit_depth": {
+          "enum": [
+            16,
+            24
+          ]
+        },
+        "duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 180
+        },
+        "peak_dbfs": {
+          "type": "number",
+          "maximum": 0
+        },
+        "clipped_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quiet_sample_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "required": [
+        "sha256",
+        "size",
+        "sample_rate_hz",
+        "channels",
+        "bit_depth",
+        "duration_seconds",
+        "peak_dbfs",
+        "clipped_samples",
+        "quiet_sample_fraction"
+      ]
+    }
+  }
+}
