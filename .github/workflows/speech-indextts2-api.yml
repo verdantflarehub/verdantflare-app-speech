@@ -1,5 +1,6 @@
 name: Speech IndexTTS2 API
 on:
+  workflow_dispatch:
   push:
     branches: [release]
     paths:
@@ -18,6 +19,7 @@ env:
 jobs:
   image:
     name: Build and publish speech runtime
+    if: github.ref == 'refs/heads/release'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
