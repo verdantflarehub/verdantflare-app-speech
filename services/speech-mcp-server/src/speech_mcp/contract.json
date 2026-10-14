@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verdantflarehub.com/contracts/drafts/speech-mcp-v1.schema.json",
+  "title": "Speech MCP v1 inputs and voice profile",
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "content_ref": {
+      "type": "object",
+      "properties": {
+        "store_id": {
+          "$ref": "#/$defs/id"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/id"
+        },
+        "version_id": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "store_id",
+        "artifact_id",
+        "version_id"
+      ],
+      "additionalProperties": false
+    },
+    "profile": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "voice_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "engine": {
+          "const": "indextts2"
+        },
+        "model_manifest_sha256": {
+          "$ref": "#/$defs/hash"
+        },
+        "reference": {
+          "type": "object",
+          "properties": {
+            "content_ref": {
+              "$ref": "#/$defs/content_ref"
+            },
+            "sha256": {
+              "$ref": "#/$defs/hash"
+            }
+          },
+          "required": [
+            "content_ref",
+            "sha256"
+          ],
+          "additionalProperties": false
+        },
+        "candidate_state": {
+          "enum": [
+            "candidate",
+            "selected"
+          ]
+        },
+        "listening_review": {
+          "enum": [
+            "pending",
+            "approved",
+            "rejected"
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "voice_id",
+        "label",
+        "engine",
+        "model_manifest_sha256",
+        "reference",
+        "candidate_state",
+        "listening_review"
+      ],
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "voices": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/id"
+        },
+        "revision_id": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "project_id",
+        "revision_id"
+      ],
+      "additionalProperties": false
+    },
+    "create": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/id"
+        },
+        "revision_id": {
+          "$ref": "#/$defs/id"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+        },
+        "utterance_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "voice_profile": {
+          "$ref": "#/$defs/content_ref"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "language": {
+          "const": "zh-CN"
+        },
+        "emotion_vector": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "items": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.8
+          }
+        },
+        "script_ref": {
+          "$ref": "#/$defs/content_ref"
+        }
+      },
+      "required": [
+        "project_id",
+        "revision_id",
+        "idempotency_key",
+        "utterance_id",
+        "voice_profile",
+        "text",
+        "language"
+      ],
+      "additionalProperties": false
+    },
+    "status": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/id"
+        },
+        "task_id": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "project_id",
+        "task_id"
+      ],
+      "additionalProperties": false
+    },
+    "result": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/id"
+        },
+        "task_id": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "project_id",
+        "task_id"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
