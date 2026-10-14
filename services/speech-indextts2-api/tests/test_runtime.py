@@ -9,9 +9,10 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 from fastapi.testclient import TestClient
+from jsonschema import Draft202012Validator, FormatChecker
 
 from speech_runtime.audio import inspect_wav
-from speech_runtime.domain import Failure, Scope, new_id, validate_create
+from speech_runtime.domain import CONTRACT, Failure, Scope, new_id, validate_create
 from speech_runtime.models import verify_models, safe_target
 from speech_runtime.server import create_app
 from speech_runtime.store import Store
@@ -29,6 +30,9 @@ def wav(seconds=2, rate=22050, width=16):
 
 
 class Fixture(unittest.TestCase):
+    def assertContract(self, value):
+        Draft202012Validator(CONTRACT, format_checker=FormatChecker()).validate(value)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name).resolve()
@@ -100,6 +104,7 @@ class DurableQueue(Fixture):
         recovered = self.store.get(self.scope, task["task_id"])
         self.assertEqual(recovered["status"], "failed")
         self.assertTrue(recovered["error"]["recovery_required"])
+        self.assertContract(recovered)
         self.assertEqual(self.store.create(self.scope, self.inputs)["task_id"], task["task_id"])
         self.assertIsNone(self.store.claim())
 
@@ -133,8 +138,25 @@ class DurableQueue(Fixture):
         result = self.store.get(self.scope, task["task_id"])
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(len(result["outputs"]), 3)
+        self.assertContract(result)
         (self.store.output_dir(task["task_id"]) / "original.wav").write_bytes(b"corruption")
         self.assertFailure("output_integrity_failed", lambda: self.store.get(self.scope, task["task_id"]))
+
+    def test_worker_stops_accepting_tasks_after_store_failure(self):
+        class Engine:
+            def load(inner):
+                pass
+        original_claim = self.store.claim
+        def broken_claim():
+            raise RuntimeError("simulated_disk_failure")
+        self.store.claim = broken_claim
+        worker = Worker(self.store, Engine())
+        worker.start()
+        worker.thread.join(timeout=2)
+        self.assertFalse(worker.ready)
+        self.assertEqual(worker.error, "worker_failed")
+        self.assertFalse(worker.thread.is_alive())
+        self.store.claim = original_claim
 
 
 class InternalAPI(Fixture):
@@ -161,14 +183,17 @@ class InternalAPI(Fixture):
         response = self.client.post("/v1/tasks", json=self.inputs, headers=self.headers)
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"]["code"], "model_not_ready")
+        self.assertContract(response.json())
 
     def test_upload_create_replay_and_scope_query(self):
         response = self.client.put("/v1/references/" + self.hash, content=self.reference,
                                    headers=self.headers | {"Content-Type": "audio/wav"})
         self.assertEqual(response.status_code, 200)
+        self.assertContract(response.json())
         self.app.state.worker.ready = True
         result = self.client.post("/v1/tasks", json=self.inputs, headers=self.headers)
         self.assertEqual(result.status_code, 202)
+        self.assertContract(result.json())
         task_id = result.json()["task_id"]
         self.app.state.worker.ready = False
         replay = self.client.post("/v1/tasks", json=self.inputs, headers=self.headers)

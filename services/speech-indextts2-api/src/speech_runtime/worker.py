@@ -23,9 +23,8 @@ class IndexEngine:
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         os.environ["HF_DATASETS_OFFLINE"] = "1"
         os.environ["NLTK_DATA"] = str(self.root / "nltk_data")
-        import torch
-        if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-            raise RuntimeError("single_cuda_device_required")
+        from .probe import gpu_probe
+        gpu_probe()
         from indextts.infer_v2 import IndexTTS2
         self.model = IndexTTS2(cfg_path=str(self.root / "indextts2/config.yaml"),
                                model_dir=str(self.root / "indextts2"), device="cuda:0",
