@@ -1,10 +1,14 @@
 """Explicit model preparation and offline verification; never used to fetch at inference."""
 import concurrent.futures
+import fcntl
 import hashlib
+import http.client
 import json
 import os
 import shutil
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -14,6 +18,57 @@ from .audio import digest_file
 from .store import atomic_write
 
 BUNDLED_MANIFEST = Path(os.environ.get("SPEECH_MODEL_MANIFEST", "/opt/service/models/manifest.lock.json"))
+
+
+def download_file(path, item, endpoint, attempts=4):
+    """Resume only a fixed object, validating both transport range and final digest."""
+    temporary = path.with_name(path.name + ".download")
+    url = item["url"].replace("https://huggingface.co/", endpoint + "/", 1)
+    if urllib.parse.urlparse(item["url"]).hostname == "huggingface.co":
+        url += "?download=true"
+    for attempt in range(attempts):
+        offset = temporary.stat().st_size if temporary.exists() else 0
+        if offset >= item["size"] and temporary.exists():
+            check_file(temporary, item)
+            os.replace(temporary, path)
+            return
+        headers = {"User-Agent": "huggingface_hub/0.34.4; python/3.11; VerdantFlare-Speech", "Accept-Encoding": "identity"}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+                if response.status == 206:
+                    expected = f"bytes {offset}-{item['size'] - 1}/{item['size']}"
+                    if response.headers.get("Content-Range") != expected:
+                        raise ValueError("invalid_model_content_range")
+                    mode = "ab" if offset else "wb"
+                elif response.status == 200:
+                    offset, mode = 0, "wb"
+                else:
+                    raise ValueError("invalid_model_http_status")
+                with temporary.open(mode) as output:
+                    count, reported = offset, offset
+                    while block := response.read(1024 * 1024):
+                        count += len(block)
+                        if count > item["size"]:
+                            raise ValueError("model_download_oversize")
+                        output.write(block)
+                        if count - reported >= 64 * 1024 * 1024:
+                            print(json.dumps({"file": item["path"], "state": "downloading", "bytes": count, "total": item["size"]}), flush=True)
+                            reported = count
+                    output.flush()
+                    os.fsync(output.fileno())
+                if count != item["size"]:
+                    raise OSError("incomplete_model_download")
+            check_file(temporary, item)
+            os.replace(temporary, path)
+            return
+        except (OSError, urllib.error.URLError, http.client.IncompleteRead) as error:
+            print(json.dumps({"file": item["path"], "state": "download_retry" if attempt + 1 < attempts else "download_failed",
+                              "attempt": attempt + 1, "error_class": type(error).__name__, "http_status": getattr(error, "code", None)}), flush=True)
+            if attempt + 1 == attempts:
+                raise RuntimeError("model_download_failed: " + item["path"]) from None
+            time.sleep(min(2 ** attempt, 8))
 
 
 def safe_target(root, relative):
@@ -73,6 +128,15 @@ def extract_resource(root, item, verify_only=False):
 def prepare_models(root, manifest_path=BUNDLED_MANIFEST):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
+    with (root / ".prepare.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("model_preparation_already_active") from None
+        _prepare_models(root, manifest_path)
+
+
+def _prepare_models(root, manifest_path):
     raw, manifest = read_manifest(manifest_path)
     installed = root / "manifest.lock.json"
     if installed.exists() and installed.read_bytes() != raw:
@@ -89,29 +153,20 @@ def prepare_models(root, manifest_path=BUNDLED_MANIFEST):
             print(json.dumps({"file": item["path"], "state": "reused"}), flush=True)
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".download")
-        url = item["url"].replace("https://huggingface.co/", endpoint + "/", 1)
-        request = urllib.request.Request(url, headers={"User-Agent": "VerdantFlare-Speech/0.1"})
         # Public fixed objects only; no credentials are attached to redirected requests.
-        with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as output:
-            count = 0
-            while True:
-                block = response.read(1024 * 1024)
-                if not block:
-                    break
-                count += len(block)
-                if count > item["size"]:
-                    raise ValueError("model_download_oversize")
-                output.write(block)
-            output.flush()
-            os.fsync(output.fileno())
-        check_file(temporary, item)
-        os.replace(temporary, path)
+        download_file(path, item, endpoint)
         extract_resource(root, item)
         print(json.dumps({"file": item["path"], "state": "verified"}), flush=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        list(pool.map(download, manifest["files"]))
+        futures = [pool.submit(download, item) for item in manifest["files"]]
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+        except Exception:
+            for future in futures:
+                future.cancel()
+            raise
     atomic_write(installed, raw)
     verify_models(root, manifest_path)
 

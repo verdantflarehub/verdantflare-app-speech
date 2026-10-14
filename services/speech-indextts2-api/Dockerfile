@@ -14,19 +14,20 @@ RUN --mount=type=cache,target=/root/.cache/uv uv sync --python /usr/local/bin/py
 RUN .venv/bin/python -c "from indextts.utils.front import TextNormalizer; TextNormalizer().load()"
 COPY pyproject.toml /opt/service/pyproject.toml
 COPY src /opt/service/src
-RUN uv pip install --python /opt/indextts/.venv/bin/python --no-deps /opt/service
+RUN uv pip install --python /opt/indextts/.venv/bin/python --target /opt/speech-runtime --no-deps /opt/service
 
 FROM python:3.11.14-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfile1 libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/* && useradd --uid 10001 --create-home speech
 COPY --from=build /opt/indextts /opt/indextts
+COPY --from=build /opt/speech-runtime /opt/speech-runtime
 COPY models/manifest.lock.json /opt/service/models/manifest.lock.json
 COPY upstream.lock.json /opt/service/upstream.lock.json
-ENV PATH="/opt/indextts/.venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+ENV PATH="/opt/indextts/.venv/bin:$PATH" PYTHONPATH=/opt/speech-runtime PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     SPEECH_MODEL_ROOT=/models SPEECH_TASK_ROOT=/data/runtime SPEECH_MODEL_MANIFEST=/opt/service/models/manifest.lock.json \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HOME=/tmp/huggingface \
     NLTK_DATA=/models/nltk_data NUMBA_CACHE_DIR=/tmp/numba MPLCONFIGDIR=/tmp/matplotlib \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
-LABEL org.opencontainers.image.version="0.1.1" org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-speech"
+LABEL org.opencontainers.image.version="0.1.2" org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-speech"
 WORKDIR /opt/indextts
 USER 10001:10001
 EXPOSE 8080
