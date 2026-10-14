@@ -1,12 +1,13 @@
 import hashlib
 import io
+import json
 import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
-from speech_runtime.models import download_file
+from speech_runtime.models import download_file, read_sources
 
 
 class Response(io.BytesIO):
@@ -74,3 +75,23 @@ class ModelDownload(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         self.assertEqual(self.partial.read_bytes(), self.data[:5])
         self.assertFalse(self.path.exists())
+
+    def test_mirror_source_preserves_locked_identity(self):
+        source = dict(self.item, path="indextts2/model.bin", revision="a"*40)
+        source["url"] = "https://www.modelscope.cn/models/IndexTeam/IndexTTS-2/resolve/" + source["revision"] + "/model.bin"
+        manifest = {"files": [dict(self.item, path=source["path"])]}
+        path = self.path.with_name("sources.json")
+        path.write_text(json.dumps({"schema_version": 1, "files": [source]}))
+        self.assertEqual(read_sources(manifest, path), {source["path"]: source["url"]})
+        for change in ({"sha256": "0"*64}, {"revision": "master"}, {"url": "https://elsewhere.invalid/model.bin"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                path.write_text(json.dumps({"schema_version": 1, "files": [source | change]}))
+                read_sources(manifest, path)
+
+    def test_mirror_range_download_uses_exact_pinned_url(self):
+        self.partial.write_bytes(self.data[:5])
+        url = "https://www.modelscope.cn/models/IndexTeam/IndexTTS-2/resolve/" + "a"*40 + "/gpt.pth"
+        with patch("speech_runtime.models.urllib.request.urlopen", return_value=Response(self.data[5:], 206, {"Content-Range": f"bytes 5-{len(self.data)-1}/{len(self.data)}"})) as request:
+            download_file(self.path, self.item, "https://hf-mirror.com", source_url=url)
+        self.assertEqual(request.call_args.args[0].full_url, url)
+        self.assertEqual(self.path.read_bytes(), self.data)

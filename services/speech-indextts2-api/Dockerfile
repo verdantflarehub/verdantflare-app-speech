@@ -21,13 +21,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfi
 COPY --from=build /opt/indextts /opt/indextts
 COPY --from=build /opt/speech-runtime /opt/speech-runtime
 COPY models/manifest.lock.json /opt/service/models/manifest.lock.json
+COPY models/download-sources.lock.json /opt/service/models/download-sources.lock.json
 COPY upstream.lock.json /opt/service/upstream.lock.json
 ENV PATH="/opt/indextts/.venv/bin:$PATH" PYTHONPATH=/opt/speech-runtime PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     SPEECH_MODEL_ROOT=/models SPEECH_TASK_ROOT=/data/runtime SPEECH_MODEL_MANIFEST=/opt/service/models/manifest.lock.json \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HOME=/tmp/huggingface \
     NLTK_DATA=/models/nltk_data NUMBA_CACHE_DIR=/tmp/numba MPLCONFIGDIR=/tmp/matplotlib \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
-LABEL org.opencontainers.image.version="0.1.2" org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-speech"
+LABEL org.opencontainers.image.version="0.1.3" org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-speech"
 WORKDIR /opt/indextts
 USER 10001:10001
 EXPOSE 8080

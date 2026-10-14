@@ -5,6 +5,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -18,13 +19,35 @@ from .audio import digest_file
 from .store import atomic_write
 
 BUNDLED_MANIFEST = Path(os.environ.get("SPEECH_MODEL_MANIFEST", "/opt/service/models/manifest.lock.json"))
+BUNDLED_SOURCES = Path("/opt/service/models/download-sources.lock.json")
 
 
-def download_file(path, item, endpoint, attempts=4):
+def read_sources(manifest, path=BUNDLED_SOURCES):
+    sources = json.loads(Path(path).read_bytes())
+    if sources.get("schema_version") != 1:
+        raise ValueError("invalid_download_sources")
+    expected = {item["path"]: item for item in manifest["files"]}
+    result = {}
+    for item in sources["files"]:
+        original = expected.get(item["path"])
+        if original is None or item["path"] in result or not item["path"].startswith("indextts2/"):
+            raise ValueError("unexpected_download_source")
+        if item["sha256"] != original["sha256"] or item["size"] != original["size"]:
+            raise ValueError("download_source_identity_mismatch")
+        if not re.fullmatch(r"[0-9a-f]{40}", item["revision"]):
+            raise ValueError("download_source_revision_required")
+        url = "https://www.modelscope.cn/models/IndexTeam/IndexTTS-2/resolve/" + item["revision"] + "/" + urllib.parse.quote(item["path"][10:], safe="/")
+        if item["url"] != url:
+            raise ValueError("untrusted_download_source")
+        result[item["path"]] = item["url"]
+    return result
+
+
+def download_file(path, item, endpoint, attempts=4, source_url=None):
     """Resume only a fixed object, validating both transport range and final digest."""
     temporary = path.with_name(path.name + ".download")
-    url = item["url"].replace("https://huggingface.co/", endpoint + "/", 1)
-    if urllib.parse.urlparse(item["url"]).hostname == "huggingface.co":
+    url = source_url or item["url"].replace("https://huggingface.co/", endpoint + "/", 1)
+    if source_url is None and urllib.parse.urlparse(item["url"]).hostname == "huggingface.co":
         url += "?download=true"
     for attempt in range(attempts):
         offset = temporary.stat().st_size if temporary.exists() else 0
@@ -33,6 +56,8 @@ def download_file(path, item, endpoint, attempts=4):
             os.replace(temporary, path)
             return
         headers = {"User-Agent": "huggingface_hub/0.34.4; python/3.11; VerdantFlare-Speech", "Accept-Encoding": "identity"}
+        if source_url:
+            headers["User-Agent"] = "modelscope/1.18.0; python/3.11; VerdantFlare-Speech"
         if offset:
             headers["Range"] = f"bytes={offset}-"
         try:
@@ -144,6 +169,10 @@ def _prepare_models(root, manifest_path):
     endpoint = os.environ.get("SPEECH_MODEL_ENDPOINT", "https://huggingface.co")
     if endpoint not in ("https://huggingface.co", "https://hf-mirror.com"):
         raise ValueError("untrusted_model_endpoint")
+    enabled = os.environ.get("SPEECH_MODEL_USE_MIRRORS", "1")
+    if enabled not in ("0", "1"):
+        raise ValueError("invalid_model_mirror_setting")
+    sources = read_sources(manifest) if enabled == "1" else {}
 
     def download(item):
         path = safe_target(root, item["path"])
@@ -154,7 +183,7 @@ def _prepare_models(root, manifest_path):
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         # Public fixed objects only; no credentials are attached to redirected requests.
-        download_file(path, item, endpoint)
+        download_file(path, item, endpoint, source_url=sources.get(item["path"]))
         extract_resource(root, item)
         print(json.dumps({"file": item["path"], "state": "verified"}), flush=True)
 
