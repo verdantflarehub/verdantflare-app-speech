@@ -10,5 +10,6 @@
 !scripts/prepare_source.py
 !models/
 !models/manifest.lock.json
+!models/download-sources.lock.json
 **/__pycache__
 **/*.pyc
