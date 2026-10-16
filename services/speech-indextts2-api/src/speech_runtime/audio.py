@@ -10,6 +10,23 @@ from .domain import Failure
 MAX_REFERENCE_BYTES = 2 * 1024 * 1024
 
 
+def pcm16_with_headroom(samples):
+    """Quantize unclipped PCM-unit floats with one gain for the whole utterance.
+
+    Called before upstream int16 conversion, never on already clipped audio.
+    A 3 dB margin leaves room for the editing copy's sample-rate conversion.
+    Quiet takes are not boosted; relative levels across chunks are preserved.
+    """
+    import numpy as np
+    values = np.asarray(samples, dtype=np.float64)
+    if values.size == 0 or not np.isfinite(values).all():
+        raise Failure("invalid_engine_waveform", 500)
+    ceiling = 32767 * 10 ** (-3 / 20)
+    peak = float(np.abs(values).max())
+    gain = min(1.0, ceiling / peak) if peak else 1.0
+    return np.rint(values * gain).astype(np.int16)
+
+
 def inspect_wav(data, reference=False):
     import numpy as np
     import soundfile as sf

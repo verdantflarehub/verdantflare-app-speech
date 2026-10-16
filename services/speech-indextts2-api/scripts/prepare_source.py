@@ -39,6 +39,12 @@ def prepare(lock_path, destination, archive_path=None):
         for entry in extracted.iterdir():
             entry.rename(destination / entry.name)
     patches = [
+        # Preserve vocoder peaks until all chunks are assembled. Clamping each
+        # chunk first destroys information that later gain reduction cannot fix.
+        ('indextts/infer_v2.py', 'wav = torch.clamp(32767 * wav, -32767.0, 32767.0)',
+         'wav = torch.clamp(32767 * wav, -32767.0, 32767.0) if stream_return else 32767 * wav'),
+        ('indextts/infer_v2.py', 'wav = wav.cpu()  # to cpu',
+         'from speech_runtime.audio import pcm16_with_headroom\n        wav = torch.from_numpy(pcm16_with_headroom(wav.cpu().numpy()))'),
         ('indextts/infer_v2.py', "os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'", "os.environ.setdefault('HF_HUB_CACHE', '/tmp/huggingface')"),
         ('indextts/infer_v2.py', 'SeamlessM4TFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")', 'SeamlessM4TFeatureExtractor.from_pretrained(os.path.join(os.environ["SPEECH_MODEL_ROOT"], "w2v-bert"), local_files_only=True)'),
         ('indextts/infer_v2.py', 'hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")', 'os.path.join(os.environ["SPEECH_MODEL_ROOT"], "maskgct/semantic_codec/model.safetensors")'),
