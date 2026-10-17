@@ -10,10 +10,27 @@ RUN --mount=type=cache,target=/root/.cache/uv uv sync --python /usr/local/bin/py
 COPY pyproject.toml /opt/service/pyproject.toml
 COPY src /opt/service/src
 RUN uv pip install --python /opt/engine/.venv/bin/python --target /opt/runner --no-deps /opt/service
+COPY scripts/partition_environment.py /opt/build/partition_environment.py
+RUN python /opt/build/partition_environment.py /opt/engine /opt/environment-layers
 
 FROM python:3.11.14-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends libsndfile1 && rm -rf /var/lib/apt/lists/* && useradd --uid 10001 --create-home speech
-COPY --from=build /opt/engine /opt/engine
+COPY --from=build /opt/environment-layers/00/ /opt/engine/
+COPY --from=build /opt/environment-layers/01/ /opt/engine/
+COPY --from=build /opt/environment-layers/02/ /opt/engine/
+COPY --from=build /opt/environment-layers/03/ /opt/engine/
+COPY --from=build /opt/environment-layers/04/ /opt/engine/
+COPY --from=build /opt/environment-layers/05/ /opt/engine/
+COPY --from=build /opt/environment-layers/06/ /opt/engine/
+COPY --from=build /opt/environment-layers/07/ /opt/engine/
+COPY --from=build /opt/environment-layers/08/ /opt/engine/
+COPY --from=build /opt/environment-layers/09/ /opt/engine/
+COPY --from=build /opt/environment-layers/10/ /opt/engine/
+COPY --from=build /opt/environment-layers/11/ /opt/engine/
+COPY --from=build /opt/environment-layers/12/ /opt/engine/
+COPY --from=build /opt/environment-layers/13/ /opt/engine/
+COPY --from=build /opt/environment-layers/14/ /opt/engine/
+COPY --from=build /opt/environment-layers/15/ /opt/engine/
 COPY --from=build /opt/runner /opt/runner
 COPY --from=build /opt/voxcpm/src /opt/voxcpm/src
 COPY --from=build /opt/voxcpm/LICENSE /opt/voxcpm/LICENSE
@@ -22,7 +39,7 @@ COPY upstream.lock.json /opt/service/upstream.lock.json
 ENV PATH="/opt/engine/.venv/bin:$PATH" PYTHONPATH="/opt/runner:/opt/voxcpm/src" \
     PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     HF_HOME=/tmp/huggingface NUMBA_CACHE_DIR=/tmp/numba NVIDIA_DRIVER_CAPABILITIES=compute,utility
-LABEL org.opencontainers.image.version="0.1.1" org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-speech"
+LABEL org.opencontainers.image.version="0.1.2" org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-speech"
 WORKDIR /opt/service
 USER 10001:10001
 ENTRYPOINT ["python", "-m", "voice_design.cli"]
