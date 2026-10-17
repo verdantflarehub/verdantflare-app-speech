@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Internal voice candidate request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "candidate_id", "mode", "text", "seed", "reference"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "candidate_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"},
+    "mode": {"enum": ["clone", "design"]},
+    "text": {"type": "string", "minLength": 2, "maxLength": 120},
+    "seed": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+    "reference": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sha256", "size_bytes"],
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "size_bytes": {"type": "integer", "minimum": 45, "maximum": 2097152},
+        "content_ref": {
+          "type": "object", "additionalProperties": false,
+          "required": ["store_id", "artifact_id", "version_id"],
+          "properties": {
+            "store_id": {"$ref": "#/$defs/uuid7"},
+            "artifact_id": {"$ref": "#/$defs/uuid7"},
+            "version_id": {"$ref": "#/$defs/uuid7"}
+          }
+        }
+      }
+    },
+    "reference_traits": {"$ref": "#/$defs/description"},
+    "change_request": {"$ref": "#/$defs/description"},
+    "target_description": {"$ref": "#/$defs/description"},
+    "style_instruction": {"$ref": "#/$defs/description"}
+  },
+  "allOf": [{
+    "if": {"properties": {"mode": {"const": "design"}}},
+    "then": {
+      "required": ["reference_traits", "change_request", "target_description"],
+      "not": {"required": ["style_instruction"]}
+    },
+    "else": {"not": {"anyOf": [
+      {"required": ["reference_traits"]}, {"required": ["change_request"]},
+      {"required": ["target_description"]}
+    ]}}
+  }],
+  "$defs": {
+    "description": {"type": "string", "minLength": 2, "maxLength": 240},
+    "uuid7": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"}
+  }
+}

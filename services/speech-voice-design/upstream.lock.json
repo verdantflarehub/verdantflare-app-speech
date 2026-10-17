@@ -1,0 +1,9 @@
+{
+  "path": "source.tar.gz",
+  "size": 4117353,
+  "sha256": "a2b9d9f3076d9d6eaaf5fdb6b92e1bc7c3b4643bc9a489bace7622e04bcdbd2c",
+  "url": "https://codeload.github.com/OpenBMB/VoxCPM/tar.gz/cce58a5b59303c9bd63d12f23afe6a49a4a80c59",
+  "repository": "https://github.com/OpenBMB/VoxCPM",
+  "commit": "cce58a5b59303c9bd63d12f23afe6a49a4a80c59",
+  "license": "Apache-2.0"
+}

@@ -13,6 +13,8 @@
 
 运行时位于 `services/speech-indextts2-api`，业务服务位于 [speech-mcp-server](services/speech-mcp-server/README.md)；模型权重与用户录音不进入源码仓库。编译镜像由 GitHub Actions 在 release 分支交付，版本标签不可覆盖。部署清单与环境事实归设计仓库。
 
+参考克隆与文字音色设计候选适配位于 [speech-voice-design](services/speech-voice-design/README.md)，固定 VoxCPM2，尚未通过 GPU 验证或作为 Studio 工具开放。产品边界见[参考声线与音色设计](https://github.com/verdantflarehub/verdantflare-design/blob/dev/docs/design/speech/05-voice-design.md)。
+
 ## 3. 轻量验证
 
 安装运行时 pyproject 中的轻量服务依赖及 httpx 后，设置 PYTHONPATH 为 `services/speech-indextts2-api/src`，运行 `python -m unittest discover -s services/speech-indextts2-api/tests -v`。单元测试使用确定性假引擎验证接口和恢复，不加载 GPU，不代表真实音质通过。模型下载、载入和集成验证在 5090 dev 执行。
