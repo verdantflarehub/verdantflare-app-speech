@@ -22,7 +22,7 @@ COPY upstream.lock.json /opt/service/upstream.lock.json
 ENV PATH="/opt/engine/.venv/bin:$PATH" PYTHONPATH="/opt/runner:/opt/voxcpm/src" \
     PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     HF_HOME=/tmp/huggingface NUMBA_CACHE_DIR=/tmp/numba NVIDIA_DRIVER_CAPABILITIES=compute,utility
-LABEL org.opencontainers.image.version="0.1.0" org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-speech"
+LABEL org.opencontainers.image.version="0.1.1" org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-speech"
 WORKDIR /opt/service
 USER 10001:10001
 ENTRYPOINT ["python", "-m", "voice_design.cli"]

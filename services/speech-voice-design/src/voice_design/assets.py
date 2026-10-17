@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import urllib.parse
 import urllib.request
 
 from .request import CandidateError
@@ -36,6 +38,15 @@ def matches(path, entry):
     return path.is_file() and path.stat().st_size == entry["size"] and digest(path) == entry["sha256"]
 
 
+def download_url(entry):
+    revision = entry.get("modelscope_revision")
+    if revision is None:
+        return entry["url"]
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise CandidateError("invalid_modelscope_revision")
+    return f"https://www.modelscope.cn/models/OpenBMB/VoxCPM2/resolve/{revision}/{urllib.parse.quote(entry['path'], safe='')}"
+
+
 def verify_model(root, lock_path):
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
@@ -46,6 +57,7 @@ def verify_model(root, lock_path):
     if any(p.name not in expected | {".prepare.lock"} for p in root.iterdir()):
         raise CandidateError("unexpected_model_asset")
     for entry in lock["files"]:
+        download_url(entry)
         if not matches(asset_path(root, entry["path"]), entry):
             raise CandidateError("model_integrity_failed")
     if load_lock(root / "config.json").get("architecture") != "voxcpm2":
@@ -70,6 +82,7 @@ def prepare_model(root, lock_path):
         if any(p.name not in expected for p in root.iterdir()):
             raise CandidateError("unexpected_model_asset")
         for entry in lock["files"]:
+            url = download_url(entry)
             path = asset_path(root, entry["path"])
             if path.exists():
                 if not matches(path, entry):
@@ -82,7 +95,7 @@ def prepare_model(root, lock_path):
                 raise CandidateError("partial_model_asset_oversized")
             if start < entry["size"]:
                 headers = {"Range": f"bytes={start}-"} if start else {}
-                with urllib.request.urlopen(urllib.request.Request(entry["url"], headers=headers), timeout=120) as source:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as source:
                     if start and (source.status != 206 or not source.headers.get("Content-Range", "").startswith(f"bytes {start}-")):
                         raise CandidateError("model_resume_not_supported")
                     with part.open("ab" if part.exists() else "xb") as target:

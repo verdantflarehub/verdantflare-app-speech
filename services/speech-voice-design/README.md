@@ -4,7 +4,9 @@
 
 Developer runner for pinned VoxCPM2 reference cloning and description-based voice design. It is not an exposed Studio tool. Current deployment and behavior decisions belong to the [central design](https://github.com/verdantflarehub/verdantflare-design/blob/dev/docs/design/speech/05-voice-design.md).
 
-Source version `0.1.0`; GPU execution and audio quality are unvalidated. The existing IndexTTS2 service remains the registered speech backend. No model weights or user audio belong in this repository.
+Source version `0.1.1`; GPU execution and audio quality are unvalidated. The existing IndexTTS2 service remains the registered speech backend. No model weights or user audio belong in this repository.
+
+Model preparation uses the official OpenBMB ModelScope mirror at fixed per-file revisions. Every size and SHA-256 matches the canonical Hugging Face revision; the runtime still verifies all bytes before loading. No credentials or moving branch URLs are used. Version 0.1.1 adds this route after the dev cluster could not reach Hugging Face or hf-mirror.com.
 
 ## 2. Commands
 
@@ -25,3 +27,5 @@ Successful execution produces `request.json`, `source-reference.wav`, `started.j
 Install only the lightweight dependencies in `pyproject.toml` for unit tests; run `PYTHONPATH=src python -m unittest discover -s tests -v` from this directory. Tests use a fake engine and synthetic in-memory signals, never import VoxCPM or run inference.
 
 `engine/pyproject.toml` and `engine/uv.lock` pin the Linux CUDA environment. The build fetches a checksum-locked source archive and copies only source plus its license. Upstream training, web UI, denoising and text normalization extras are excluded. Upstream source is not modified. The GitHub Actions workflow builds the image; no local container builds. Actual runtime and GPU checks use 5090 dev according to the central deployment rules.
+
+The dependency environment is a separate, uninstalled resolver project at version 0.1.0; its package set is unchanged by the application 0.1.1 download-source fix, preserving the CUDA build cache.

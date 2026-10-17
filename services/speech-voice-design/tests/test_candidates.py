@@ -214,6 +214,28 @@ class CandidateTests(unittest.TestCase):
                 prepare_model(self.models, self.lock)
         self.assertEqual(part.read_bytes(), data[:5])
 
+    def test_fixed_official_modelscope_source_preserves_content_identity(self):
+        data = self.config.read_bytes()
+        self.config.unlink()
+        lock = json.loads(self.lock.read_text())
+        lock["files"][0]["modelscope_revision"] = "a" * 40
+        self.lock.write_text(json.dumps(lock))
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(data)) as fetch:
+            result = prepare_model(self.models, self.lock)
+        request = fetch.call_args.args[0]
+        self.assertEqual(request.full_url, "https://www.modelscope.cn/models/OpenBMB/VoxCPM2/resolve/" + "a" * 40 + "/config.json")
+        self.assertIsNone(request.get_header("Authorization"))
+        self.assertEqual(self.config.read_bytes(), data)
+        self.assertEqual(result["revision"], MODEL_REVISION)
+
+    def test_moving_modelscope_branch_is_rejected_before_network(self):
+        lock = json.loads(self.lock.read_text())
+        lock["files"][0]["modelscope_revision"] = "master"
+        self.lock.write_text(json.dumps(lock))
+        with patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")):
+            with self.assertRaisesRegex(CandidateError, "invalid_modelscope_revision"):
+                prepare_model(self.models, self.lock)
+
     def test_source_receipt_rejects_modified_or_added_code(self):
         source = self.root / "src"
         source.mkdir()
