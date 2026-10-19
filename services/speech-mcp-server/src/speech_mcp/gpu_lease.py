@@ -43,6 +43,14 @@ def parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def replicas_from_scale(payload: dict) -> int:
+    # Kubernetes omits spec.replicas when the desired count is zero.
+    spec = payload.get("spec") or {}
+    if "replicas" not in spec:
+        return 0
+    return int(spec["replicas"])
+
+
 def held_by_other(lease: dict | None, holder: str, now: datetime) -> str | None:
     spec = (lease or {}).get("spec") or {}
     identity = spec.get("holderIdentity") or ""
@@ -142,7 +150,7 @@ class K8sApi:
         path = f"/apis/apps/v1/namespaces/{self.namespace}/deployments/{name}/scale"
         response = self._request("GET", path)
         response.raise_for_status()
-        return int(response.json()["spec"]["replicas"])
+        return replicas_from_scale(response.json())
 
     def patch_scale(self, name: str, replicas: int) -> None:
         path = f"/apis/apps/v1/namespaces/{self.namespace}/deployments/{name}/scale"
