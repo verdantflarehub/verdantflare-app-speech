@@ -1,10 +1,13 @@
 import asyncio
 import contextlib
 import logging
+import threading
+import time
 
 from . import __version__
 from .clients import MAX_OUTPUT
 from .domain import Failure, canonical, digest, new_id, validate
+from .gpu_lease import GpuCoordinator, LeaseBusy
 
 log = logging.getLogger("speech_worker")
 
@@ -12,11 +15,24 @@ log = logging.getLogger("speech_worker")
 class Worker:
     def __init__(self, service):
         self.service, self.store, self.peers = service, service.store, service.peers
+        self.gpu = getattr(service, "gpu", None) or GpuCoordinator.from_environment()
+        if self.gpu.enabled:
+            threading.Thread(target=self._idle, name="speech-gpu-idle", daemon=True).start()
+
+    def _idle(self):
+        while True:
+            time.sleep(30)
+            try:
+                self.gpu.maybe_scale_down()
+            except Exception:
+                log.error("speech_gpu_idle_scale_failed")
 
     async def renew(self, row):
         while True:
             await asyncio.sleep(20)
             await asyncio.to_thread(self.store.renew, row)
+            if row["state"].get("gpu_held") and self.gpu.enabled:
+                await asyncio.to_thread(self.gpu.renew)
 
     async def run(self):
         while True:
@@ -45,6 +61,8 @@ class Worker:
             if error.code != "lease_lost":
                 await asyncio.to_thread(self.store.save, row,
                                         status="running" if error.retry else "failed", error=error.code, delay=15)
+            if not error.retry:
+                await self._release_gpu(row)
         finally:
             for task in (operation, heartbeat):
                 task.cancel()
@@ -58,6 +76,8 @@ class Worker:
         p, req, state = row["principal"], row["request"], row["state"]
         pid, phase = row["project_id"], row["phase"]
         await self.peers.open(p, pid, write=True)
+        if phase in ("submit", "inference"):
+            await self._ensure_gpu(row)
         if phase == "reference":
             profile = state["profile"]
             data, _ = await self.peers.content(p, profile["reference"]["content_ref"], pid, req["revision_id"], 2 << 20)
@@ -112,6 +132,7 @@ class Worker:
             complete = {x["name"] for x in state["outputs"]}
             entry = next((x for x in state["archive_entries"] if x["name"] not in complete), None)
             if entry is None:
+                await self._release_gpu(row)
                 await self.save(row, phase="complete", status="succeeded")
                 return
             if entry["name"] == "generation.json":
@@ -126,3 +147,31 @@ class Worker:
             await self.save(row)
         else:
             raise Failure("invalid_task_phase", 500)
+
+    async def _ensure_gpu(self, row):
+        if not self.gpu.enabled:
+            return
+        if row["state"].get("gpu_held"):
+            await asyncio.to_thread(self.gpu.renew)
+            return
+        try:
+            await asyncio.to_thread(self.gpu.acquire_for_queue)
+        except LeaseBusy as error:
+            raise Failure("waiting_gpu_lease", 503, True) from error
+        row["state"]["gpu_held"] = True
+        await asyncio.to_thread(self.gpu.scale_to, 1)
+        deadline = time.monotonic() + self.gpu.ready_seconds
+        while time.monotonic() < deadline:
+            try:
+                health = await self.peers.runtime.json(row["principal"], "GET", "/health", project_id=row["project_id"])
+                if health.get("ready") is True:
+                    return
+            except Failure:
+                pass
+            await asyncio.sleep(2)
+        raise Failure("model_not_ready", 503, True)
+
+    async def _release_gpu(self, row):
+        if not self.gpu.enabled or not row["state"].pop("gpu_held", None):
+            return
+        await asyncio.to_thread(self.gpu.release)

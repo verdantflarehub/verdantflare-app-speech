@@ -3,14 +3,16 @@ import re
 
 from . import __version__
 from .domain import Failure, canonical, digest, public, validate
+from .gpu_lease import GpuCoordinator
 
 VOICE_PATH = re.compile(r"^speech/voices/[a-z0-9][a-z0-9_-]{0,63}/profile\.json$")
 
 
 class Service:
-    def __init__(self, store, peers, model_hash):
+    def __init__(self, store, peers, model_hash, gpu=None):
         validate("hash", model_hash)
         self.store, self.peers, self.model_hash = store, peers, model_hash
+        self.gpu = gpu if gpu is not None else GpuCoordinator.from_environment()
 
     async def call(self, name, args, p):
         action = name.removeprefix("speech.")
@@ -19,12 +21,18 @@ class Service:
         validate(action, args)
         if action == "capabilities":
             ready = False
+            reason = "connect_failed"
             try:
                 health = await self.peers.runtime.json(p, "GET", "/health")
                 ready = health.get("ready") is True
+                reason = "ok" if ready else "health_not_ready"
             except Failure:
-                pass
+                reason = self._runtime_reason()
             return {"service_version": __version__, "engine": "indextts2", "ready": ready,
+                    "reason": reason,
+                    "wake_on_task": reason in {"scaled_to_zero", "waiting_gpu_lease"},
+                    "layers": {"tool_registered": True, "orchestration_alive": self.gpu.api_ok(),
+                               "backend_ready": ready},
                     "configured_model_manifest_sha256": self.model_hash,
                     "languages": ["zh-CN"], "max_text_characters": 500, "reference_audio_required": True,
                     "reference_seconds": {"min": 1, "max": 15}, "reference_max_bytes": 2 << 20,
@@ -75,6 +83,18 @@ class Service:
             raise Failure("model_not_ready", 503, True)
         state = {"profile": profile, "profile_sha256": sha, "capabilities": caps, "outputs": []}
         return public(await asyncio.to_thread(self.store.create, p, args, state))
+
+    def _runtime_reason(self):
+        if not self.gpu.enabled:
+            return "connect_failed"
+        try:
+            if self.gpu.peer_holder():
+                return "waiting_gpu_lease"
+            if self.gpu.replicas() == 0:
+                return "scaled_to_zero"
+        except Exception:
+            return "connect_failed"
+        return "connect_failed"
 
     async def authorize(self, p, permission):
         if not isinstance(permission, dict) or set(permission) != {"action", "source"} or permission["action"] != "write":
