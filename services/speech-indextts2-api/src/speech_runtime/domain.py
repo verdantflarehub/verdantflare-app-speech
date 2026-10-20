@@ -46,10 +46,27 @@ def validate_create(value):
         raise Failure("invalid_input")
     if not value["text"].strip() or any(ord(c) < 32 and c not in "\n\t" for c in value["text"]):
         raise Failure("invalid_text")
+    if "expected_text" in value and (
+        not value["expected_text"].strip() or any(ord(c) < 32 and c not in "\n\t" for c in value["expected_text"])
+    ):
+        raise Failure("invalid_text")
+    emo_keys = [k for k in ("emotion_vector", "emotion_text", "emotion_reference") if k in value]
+    if len(emo_keys) > 1:
+        raise Failure("conflicting_emotion_inputs")
     vector = value.get("emotion_vector")
     if vector is not None and (any(not math.isfinite(x) for x in vector) or sum(vector) > 0.800000001):
         raise Failure("invalid_emotion_vector")
+    if "emotion_text" in value and (
+        not value["emotion_text"].strip() or any(ord(c) < 32 and c not in "\n\t" for c in value["emotion_text"])
+    ):
+        raise Failure("invalid_emotion_text")
+    if "emotion_reference" in value:
+        alpha = value["emotion_reference"].get("alpha")
+        if not isinstance(alpha, (int, float)) or isinstance(alpha, bool) or not math.isfinite(alpha) or not (0 < alpha <= 1.0):
+            raise Failure("invalid_emotion_reference")
     if "target_duration_seconds" in value and not math.isfinite(value["target_duration_seconds"]):
+        raise Failure("invalid_duration")
+    if "shot_window_seconds" in value and not math.isfinite(value["shot_window_seconds"]):
         raise Failure("invalid_duration")
     return value
 

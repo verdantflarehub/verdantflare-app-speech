@@ -108,6 +108,13 @@ class Store:
                 raise Failure("reference_not_found", 404)
             if digest_file(reference) != inputs["reference_sha256"]:
                 raise Failure("stored_reference_corrupt", 409)
+            if "emotion_reference" in inputs:
+                emo_hash = inputs["emotion_reference"]["reference_sha256"]
+                emo_ref = self.reference_path(scope, emo_hash)
+                if not emo_ref.is_file():
+                    raise Failure("reference_not_found", 404)
+                if digest_file(emo_ref) != emo_hash:
+                    raise Failure("stored_reference_corrupt", 409)
             count = self.db.execute("SELECT count(*) FROM tasks WHERE status IN ('pending','running')").fetchone()[0]
             if count >= 16:
                 raise Failure("queue_full", 429)

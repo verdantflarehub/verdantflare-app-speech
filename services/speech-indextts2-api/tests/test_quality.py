@@ -5,7 +5,9 @@ import unittest
 import numpy as np
 import soundfile as sf
 
+from speech_runtime.asr import WhisperSmallASR, compare_transcript
 from speech_runtime.audio import inspect_wav, integrated_lufs, quality_warnings, silence_edges, true_peak_dbtp
+from speech_runtime.domain import Failure, validate_create
 
 
 def sine(freq, seconds, rate, amplitude, phase=0.0):
@@ -98,6 +100,64 @@ class Report(unittest.TestCase):
         hot = {"clipped_samples": 37, "true_peak_dbtp": 0.6}
         self.assertEqual([w["code"] for w in quality_warnings(hot, 0.3)], ["clipping", "true_peak_over", "window_overrun"])
         self.assertEqual({w["level"] for w in quality_warnings(hot)}, {"error"})
+        mismatch = {"state": "checked", "cer": 8.3}
+        self.assertEqual(
+            [w["code"] for w in quality_warnings(hot, 0.3, mismatch)],
+            ["clipping", "true_peak_over", "transcript_mismatch", "window_overrun"],
+        )
+        self.assertEqual(quality_warnings(clean, None, {"state": "unavailable", "reason": "asr_model_not_loaded"}), [])
+
+
+class TranscriptCheck(unittest.TestCase):
+    def test_exact_match_and_punctuation_invariance(self):
+        res = compare_transcript("娥儿，船上风大，把披风系紧些。", "娥儿, 船上风大! 把披风系紧些")
+        self.assertEqual(res["cer"], 0.0)
+        self.assertEqual(res["differences"], [])
+
+    def test_substituted_missing_and_extra_positions(self):
+        sub = compare_transcript("封住渡口，一个不许放走。", "封住路口，一个不许放走。")
+        self.assertGreater(sub["cer"], 0)
+        self.assertEqual(sub["differences"], [{"kind": "substituted", "index": 2, "expected": "渡", "heard": "路"}])
+
+        miss = compare_transcript("快走！别回头！", "快走！回头！")
+        self.assertEqual(miss["differences"], [{"kind": "missing", "index": 3, "expected": "别"}])
+
+        extra = compare_transcript("快走！", "快快走！")
+        self.assertEqual(len(extra["differences"]), 1)
+        self.assertEqual(extra["differences"][0]["kind"], "extra")
+        self.assertEqual(extra["differences"][0]["heard"], "快")
+
+    def test_lexicon_pinyin_uses_source_text_fallback(self):
+        res = compare_transcript(
+            "娥儿，船上风大，把披风ji4紧些。",
+            "娥儿，船上风大，把披风系紧些。",
+            source_text="娥儿，船上风大，把披风系紧些。",
+        )
+        self.assertEqual(res["cer"], 0.0)
+        self.assertEqual(res["differences"], [])
+
+    def test_unavailable_asr_reports_state_unavailable(self):
+        asr = WhisperSmallASR("/nonexistent-asr-dir")
+        self.assertFalse(asr.load())
+        out = asr.check_audio("/nonexistent.wav", "测试")
+        self.assertEqual(out["transcript_check"]["state"], "unavailable")
+
+    def test_mutually_exclusive_emotion_and_shot_window_inputs(self):
+        base = {
+            "idempotency_key": "E01-S03-L01.take3",
+            "text": "娥儿，船上风大。",
+            "language": "zh-CN",
+            "reference_sha256": "a" * 64,
+        }
+        self.assertEqual(validate_create(base | {"emotion_text": "温和叮嘱", "shot_window_seconds": 3.5})["emotion_text"], "温和叮嘱")
+        self.assertEqual(
+            validate_create(base | {"emotion_reference": {"reference_sha256": "b" * 64, "alpha": 0.6}})["emotion_reference"]["alpha"],
+            0.6,
+        )
+        with self.assertRaises(Failure):
+            validate_create(base | {"emotion_vector": [0] * 8, "emotion_text": "平静"})
+        with self.assertRaises(Failure):
+            validate_create(base | {"emotion_text": "平静", "emotion_reference": {"reference_sha256": "b" * 64, "alpha": 0.5}})
 
 
 if __name__ == "__main__":

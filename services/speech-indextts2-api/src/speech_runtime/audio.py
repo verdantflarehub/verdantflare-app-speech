@@ -158,13 +158,15 @@ def silence_edges(samples, rate, threshold_db=-50.0, frame_seconds=0.01):
     return float(loud[0] * size / rate), float(max(0.0, duration - (loud[-1] + 1) * size / rate))
 
 
-def quality_warnings(native, duration_difference=None):
+def quality_warnings(native, duration_difference=None, transcript_check=None):
     """Advisory only: warnings never fail a task or trigger regeneration."""
     warnings = []
     if native["clipped_samples"] > 0:
         warnings.append({"code": "clipping", "level": "error"})
     if native["true_peak_dbtp"] > TRUE_PEAK_CEILING_DBTP:
         warnings.append({"code": "true_peak_over", "level": "error"})
+    if transcript_check and transcript_check.get("state") == "checked" and transcript_check.get("cer", 0) > 0:
+        warnings.append({"code": "transcript_mismatch", "level": "warning"})
     if duration_difference is not None and duration_difference > 0:
         warnings.append({"code": "window_overrun", "level": "warning"})
     return warnings

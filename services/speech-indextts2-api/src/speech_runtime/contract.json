@@ -34,9 +34,14 @@
           "type": "string",
           "minLength": 8,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9_-]+$"
+          "pattern": "^[A-Za-z0-9_.:-]+$"
         },
         "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "expected_text": {
           "type": "string",
           "minLength": 1,
           "maxLength": 500
@@ -58,13 +63,64 @@
             "maximum": 1
           }
         },
+        "emotion_text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "emotion_reference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reference_sha256",
+            "alpha"
+          ],
+          "properties": {
+            "reference_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "alpha": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1
+            }
+          }
+        },
         "target_duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 180
+        },
+        "shot_window_seconds": {
           "type": "number",
           "exclusiveMinimum": 0,
           "maximum": 180
         }
       },
-      "description": "Target duration is advisory only; emotion sum <= 0.8 and nonblank text are runtime invariants."
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "emotion_vector",
+              "emotion_text"
+            ]
+          },
+          {
+            "required": [
+              "emotion_vector",
+              "emotion_reference"
+            ]
+          },
+          {
+            "required": [
+              "emotion_text",
+              "emotion_reference"
+            ]
+          }
+        ]
+      },
+      "description": "Target duration / shot window is advisory only; emotion sum <= 0.8, mutually exclusive emotion inputs, and nonblank text are runtime invariants."
     },
     "voice_profile": {
       "type": "object",

@@ -165,6 +165,7 @@ class DurableQueue(Fixture):
         self.assertLess(report["editing_gain_db"], 0)
         self.assertLessEqual(report["editing"]["true_peak_dbtp"], -1.0)
         self.assertIn("true_peak_over", [w["code"] for w in report["warnings"]])
+        self.assertIn("transcript_check", report)
         self.assertEqual(self.store.get(self.scope, task["task_id"])["status"], "succeeded")
 
     def test_worker_stops_accepting_tasks_after_store_failure(self):

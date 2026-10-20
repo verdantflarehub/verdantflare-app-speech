@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 
+from .asr import ASR_MODEL_ID
 from .audio import MAX_REFERENCE_BYTES
 from .domain import Failure, Scope, strict_json, validate_create
 from .store import Store
@@ -82,12 +83,17 @@ def create_app(root=None, token=None, model_root=None, engine=None, model_hash=N
 
     @app.get("/health")
     def health():
-        return JSONResponse({"ready": worker.ready, "reason": worker.error or (None if worker.ready else "model_loading")}, status_code=200 if worker.ready else 503)
+        return JSONResponse({"ready": worker.ready, "reason": worker.error or (None if worker.ready else "model_loading"),
+                             "load_seconds": getattr(worker.engine, "load_seconds", 0.0)}, status_code=200 if worker.ready else 503)
 
     @app.get("/v1/capabilities")
     def capabilities():
-        return {"engine": "indextts2", "version": "0.1.4", "model_manifest_sha256": model_hash, "ready": worker.ready,
+        asr = getattr(worker.engine, "asr", None)
+        return {"engine": "indextts2", "version": "0.1.5", "model_manifest_sha256": model_hash, "ready": worker.ready,
+                "load_seconds": getattr(worker.engine, "load_seconds", 0.0),
+                "asr_model": ASR_MODEL_ID, "asr_ready": bool(getattr(asr, "ready", False)),
                 "languages": ["zh-CN"], "reference_audio_required": True, "reference_max_seconds": 15,
+                "emotion_inputs": ["emotion_vector", "emotion_text", "emotion_reference"],
                 "emotion_vector_order": ["happy", "angry", "sad", "afraid", "disgusted", "melancholic", "surprised", "calm"],
                 "exact_duration": False, "nonverbal_performance": False, "rvc": False, "max_concurrent_inference": 1}
 
