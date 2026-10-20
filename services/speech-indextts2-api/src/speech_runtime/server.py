@@ -86,7 +86,7 @@ def create_app(root=None, token=None, model_root=None, engine=None, model_hash=N
 
     @app.get("/v1/capabilities")
     def capabilities():
-        return {"engine": "indextts2", "version": "0.1.3", "model_manifest_sha256": model_hash, "ready": worker.ready,
+        return {"engine": "indextts2", "version": "0.1.4", "model_manifest_sha256": model_hash, "ready": worker.ready,
                 "languages": ["zh-CN"], "reference_audio_required": True, "reference_max_seconds": 15,
                 "emotion_vector_order": ["happy", "angry", "sad", "afraid", "disgusted", "melancholic", "surprised", "calm"],
                 "exact_duration": False, "nonverbal_performance": False, "rvc": False, "max_concurrent_inference": 1}

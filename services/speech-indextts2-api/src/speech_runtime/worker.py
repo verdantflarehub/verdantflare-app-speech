@@ -5,7 +5,7 @@ import threading
 import time
 from pathlib import Path
 
-from .audio import digest_file, editing_copy, inspect_wav
+from .audio import TRUE_PEAK_CEILING_DBTP, digest_file, editing_copy, inspect_wav, quality_warnings
 from .domain import Failure, canonical
 from .store import atomic_write
 
@@ -103,6 +103,13 @@ class Worker:
             if editing.stat().st_size > 32 * 1024 * 1024:
                 raise Failure("output_too_large", 500)
             derived = inspect_wav(editing.read_bytes())
+            gain_db = 0.0
+            # Fixed attenuation only; no compression or limiting that would alter the performance.
+            if derived["true_peak_dbtp"] > TRUE_PEAK_CEILING_DBTP:
+                gain_db = round(TRUE_PEAK_CEILING_DBTP - 0.1 - derived["true_peak_dbtp"], 2)
+                editing.unlink()  # ffmpeg with -nostdin refuses to overwrite.
+                self.converter(original, editing, gain_db=gain_db)
+                derived = inspect_wav(editing.read_bytes())
             if derived["sample_rate_hz"] != 48000 or derived["bit_depth"] != 24:
                 raise Failure("invalid_editing_format", 500)
             if abs(native["duration_seconds"] - derived["duration_seconds"]) > 0.001:
@@ -111,9 +118,11 @@ class Worker:
                       "input_sha256": row["input_hash"], "reference_sha256": inputs["reference_sha256"],
                       "original": native, "editing": derived, "conversion": "resample_to_48000_pcm_s24le_mono",
                       "elapsed_seconds": time.monotonic() - started, "compute": compute,
-                      "creative_review": "not_reviewed", "exact_duration_control": False}
+                      "creative_review": "not_reviewed", "exact_duration_control": False,
+                      "editing_gain_db": gain_db}
             if "target_duration_seconds" in inputs:
                 report["duration_difference_seconds"] = native["duration_seconds"] - inputs["target_duration_seconds"]
+            report["warnings"] = quality_warnings(native, report.get("duration_difference_seconds"))
             atomic_write(root / "report.json", canonical(report).encode())
             outputs = []
             for name in ("original.wav", "editing.wav", "report.json"):

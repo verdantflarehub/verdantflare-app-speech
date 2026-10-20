@@ -398,6 +398,21 @@
           "type": "number",
           "minimum": 0,
           "maximum": 1
+        },
+        "true_peak_dbtp": {
+          "type": "number"
+        },
+        "integrated_lufs": {
+          "type": "number",
+          "minimum": -70
+        },
+        "leading_silence_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "trailing_silence_seconds": {
+          "type": "number",
+          "minimum": 0
         }
       },
       "required": [

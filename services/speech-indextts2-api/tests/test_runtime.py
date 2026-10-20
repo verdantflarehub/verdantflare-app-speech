@@ -142,6 +142,31 @@ class DurableQueue(Fixture):
         (self.store.output_dir(task["task_id"]) / "original.wav").write_bytes(b"corruption")
         self.assertFailure("output_integrity_failed", lambda: self.store.get(self.scope, task["task_id"]))
 
+    def test_hot_editing_copy_gets_fixed_attenuation_and_warnings(self):
+        def hot(rate, width, gain_db=0.0):
+            # Quarter-rate sine sampled off its crest: samples stay below full scale, true peak does not.
+            n = np.arange(rate)
+            samples = 0.99 * 10 ** (gain_db / 20) * np.sin(n * np.pi / 2 + np.pi / 4)
+            buffer = io.BytesIO()
+            sf.write(buffer, samples, rate, format="WAV", subtype="PCM_" + str(width))
+            return buffer.getvalue()
+        calls = []
+        class Engine:
+            def generate(inner, reference, inputs, output):
+                output.write_bytes(hot(22050, 16))
+                return {"test_engine": True}
+        def convert(original, output, gain_db=0.0):
+            calls.append(gain_db)
+            output.write_bytes(hot(48000, 24, gain_db))
+        task = self.store.create(self.scope, self.inputs)
+        Worker(self.store, Engine(), convert).execute(self.store.claim())
+        report = json.loads((self.store.output_dir(task["task_id"]) / "report.json").read_text())
+        self.assertEqual(len(calls), 2)
+        self.assertLess(report["editing_gain_db"], 0)
+        self.assertLessEqual(report["editing"]["true_peak_dbtp"], -1.0)
+        self.assertIn("true_peak_over", [w["code"] for w in report["warnings"]])
+        self.assertEqual(self.store.get(self.scope, task["task_id"])["status"], "succeeded")
+
     def test_worker_stops_accepting_tasks_after_store_failure(self):
         class Engine:
             def load(inner):
