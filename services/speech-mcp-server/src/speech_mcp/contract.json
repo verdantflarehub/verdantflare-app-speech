@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://verdantflarehub.com/contracts/drafts/speech-mcp-v1.schema.json",
-  "title": "Speech MCP v1 inputs and voice profile",
+  "title": "Speech MCP v1 inputs, voice profile, quality report, generation record and dashboard",
   "$defs": {
     "id": {
       "type": "string",
@@ -30,6 +30,48 @@
         "version_id"
       ],
       "additionalProperties": false
+    },
+    "world_voice": {
+      "description": "Fixed version of a World speaking voice (reference-voice) asset.",
+      "type": "object",
+      "properties": {
+        "asset_id": {
+          "$ref": "#/$defs/id"
+        },
+        "version_id": {
+          "$ref": "#/$defs/id"
+        },
+        "asset_version_id": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "asset_id"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "version_id"
+          ]
+        },
+        {
+          "required": [
+            "asset_version_id"
+          ]
+        }
+      ],
+      "additionalProperties": false
+    },
+    "emotion_vector": {
+      "description": "Order: happy, angry, sad, afraid, disgusted, melancholic, surprised, calm. Sum must not exceed 0.8 (checked by the service).",
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 0.8
+      }
     },
     "profile": {
       "type": "object",
@@ -94,6 +136,48 @@
       ],
       "additionalProperties": false
     },
+    "lexicon": {
+      "description": "Project pronunciation dictionary (speech/lexicon.json).",
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "entries": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "properties": {
+              "term": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "replacement": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "note": {
+                "type": "string",
+                "maxLength": 200
+              }
+            },
+            "required": [
+              "term",
+              "replacement"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "schema_version",
+        "entries"
+      ],
+      "additionalProperties": false
+    },
     "capabilities": {
       "type": "object",
       "properties": {},
@@ -117,6 +201,7 @@
       "additionalProperties": false
     },
     "create": {
+      "description": "speech.create target input. Exactly one voice source; at most one emotion input.",
       "type": "object",
       "properties": {
         "project_id": {
@@ -137,6 +222,9 @@
         "voice_profile": {
           "$ref": "#/$defs/content_ref"
         },
+        "world_voice": {
+          "$ref": "#/$defs/world_voice"
+        },
         "text": {
           "type": "string",
           "minLength": 1,
@@ -146,14 +234,38 @@
           "const": "zh-CN"
         },
         "emotion_vector": {
-          "type": "array",
-          "minItems": 8,
-          "maxItems": 8,
-          "items": {
-            "type": "number",
-            "minimum": 0,
-            "maximum": 0.8
-          }
+          "$ref": "#/$defs/emotion_vector"
+        },
+        "emotion_text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "emotion_reference": {
+          "type": "object",
+          "properties": {
+            "content_ref": {
+              "$ref": "#/$defs/content_ref"
+            },
+            "alpha": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1
+            }
+          },
+          "required": [
+            "content_ref",
+            "alpha"
+          ],
+          "additionalProperties": false
+        },
+        "lexicon_ref": {
+          "$ref": "#/$defs/content_ref"
+        },
+        "shot_window_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 180
         },
         "script_ref": {
           "$ref": "#/$defs/content_ref"
@@ -164,10 +276,53 @@
         "revision_id",
         "idempotency_key",
         "utterance_id",
-        "voice_profile",
         "text",
         "language"
       ],
+      "oneOf": [
+        {
+          "required": [
+            "voice_profile"
+          ],
+          "not": {
+            "required": [
+              "world_voice"
+            ]
+          }
+        },
+        {
+          "required": [
+            "world_voice"
+          ],
+          "not": {
+            "required": [
+              "voice_profile"
+            ]
+          }
+        }
+      ],
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "emotion_vector",
+              "emotion_text"
+            ]
+          },
+          {
+            "required": [
+              "emotion_vector",
+              "emotion_reference"
+            ]
+          },
+          {
+            "required": [
+              "emotion_text",
+              "emotion_reference"
+            ]
+          }
+        ]
+      },
       "additionalProperties": false
     },
     "status": {
@@ -201,6 +356,1024 @@
         "task_id"
       ],
       "additionalProperties": false
+    },
+    "phase": {
+      "enum": [
+        "reference",
+        "submit",
+        "loading_model",
+        "inference",
+        "validate",
+        "archive",
+        "reconcile",
+        "complete"
+      ]
+    },
+    "engine_capability": {
+      "type": "object",
+      "properties": {
+        "engine": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "model_manifest_sha256": {
+          "$ref": "#/$defs/hash"
+        },
+        "languages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "const": "zh-CN"
+          }
+        },
+        "max_text_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "reference_audio": {
+          "type": "object",
+          "properties": {
+            "min_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "max_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "max_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "sample_rates_hz": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "integer"
+              }
+            },
+            "channels": {
+              "const": 1
+            }
+          },
+          "required": [
+            "min_seconds",
+            "max_seconds",
+            "max_bytes",
+            "sample_rates_hz",
+            "channels"
+          ],
+          "additionalProperties": false
+        },
+        "emotion_inputs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "emotion_vector",
+              "emotion_text",
+              "emotion_reference"
+            ]
+          }
+        },
+        "unsupported": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "exact_duration",
+              "speed",
+              "cancel",
+              "non_verbal",
+              "streaming"
+            ]
+          }
+        }
+      },
+      "required": [
+        "engine",
+        "ready",
+        "model_manifest_sha256",
+        "languages",
+        "max_text_chars",
+        "reference_audio",
+        "emotion_inputs",
+        "unsupported"
+      ],
+      "additionalProperties": false
+    },
+    "capabilities_result": {
+      "type": "object",
+      "properties": {
+        "service_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "engines": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/engine_capability"
+          }
+        }
+      },
+      "required": [
+        "service_version",
+        "engines"
+      ],
+      "additionalProperties": false
+    },
+    "audio_metrics": {
+      "type": "object",
+      "properties": {
+        "duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "sample_rate_hz": {
+          "type": "integer"
+        },
+        "bit_depth": {
+          "enum": [
+            16,
+            24
+          ]
+        },
+        "peak_dbfs": {
+          "type": "number",
+          "maximum": 0
+        },
+        "true_peak_dbtp": {
+          "type": "number"
+        },
+        "integrated_lufs": {
+          "type": "number"
+        },
+        "clipped_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "leading_silence_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "trailing_silence_seconds": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "duration_seconds",
+        "sample_rate_hz",
+        "bit_depth",
+        "peak_dbfs",
+        "true_peak_dbtp",
+        "integrated_lufs",
+        "clipped_samples",
+        "leading_silence_seconds",
+        "trailing_silence_seconds"
+      ],
+      "additionalProperties": true
+    },
+    "transcript_check": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "const": "checked"
+            },
+            "asr_model": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "asr_text": {
+              "type": "string"
+            },
+            "cer": {
+              "type": "number",
+              "minimum": 0
+            },
+            "differences": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "missing",
+                      "extra",
+                      "substituted"
+                    ]
+                  },
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "expected": {
+                    "type": "string"
+                  },
+                  "heard": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "index"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "state",
+            "asr_model",
+            "asr_text",
+            "cer",
+            "differences"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "const": "unavailable"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "quality_report": {
+      "description": "Fields added to report.json. Warnings never change task status.",
+      "type": "object",
+      "properties": {
+        "original": {
+          "$ref": "#/$defs/audio_metrics"
+        },
+        "editing": {
+          "$ref": "#/$defs/audio_metrics"
+        },
+        "editing_gain_db": {
+          "type": "number",
+          "maximum": 0
+        },
+        "shot_window_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "duration_difference_seconds": {
+          "type": "number"
+        },
+        "transcript_check": {
+          "$ref": "#/$defs/transcript_check"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "enum": [
+                  "clipping",
+                  "true_peak_over",
+                  "transcript_mismatch",
+                  "window_overrun"
+                ]
+              },
+              "level": {
+                "enum": [
+                  "error",
+                  "warning"
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "level"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "original",
+        "editing",
+        "editing_gain_db",
+        "transcript_check",
+        "warnings"
+      ],
+      "dependentRequired": {
+        "shot_window_seconds": [
+          "duration_difference_seconds"
+        ]
+      },
+      "additionalProperties": true
+    },
+    "generation_record": {
+      "description": "Fields added to generation.json.",
+      "type": "object",
+      "properties": {
+        "input_digest": {
+          "$ref": "#/$defs/hash"
+        },
+        "voice_source": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "world"
+                },
+                "world_voice": {
+                  "$ref": "#/$defs/world_voice"
+                },
+                "reference_sha256": {
+                  "$ref": "#/$defs/hash"
+                }
+              },
+              "required": [
+                "kind",
+                "world_voice",
+                "reference_sha256"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "project_candidate"
+                },
+                "voice_profile": {
+                  "$ref": "#/$defs/content_ref"
+                },
+                "profile_sha256": {
+                  "$ref": "#/$defs/hash"
+                }
+              },
+              "required": [
+                "kind",
+                "voice_profile",
+                "profile_sha256"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "resolved_emotion_vector": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/emotion_vector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "sent": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "lexicon_hits": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "term": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "replacement": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "term",
+                  "replacement"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "source",
+            "sent",
+            "lexicon_hits"
+          ],
+          "additionalProperties": false
+        },
+        "timings": {
+          "type": "object",
+          "properties": {
+            "queue_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "load_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "inference_seconds": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "queue_seconds",
+            "load_seconds",
+            "inference_seconds"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "input_digest",
+        "voice_source",
+        "resolved_emotion_vector",
+        "text",
+        "timings"
+      ],
+      "additionalProperties": true
+    },
+    "review_state": {
+      "enum": [
+        "pending",
+        "selected",
+        "needs_revision"
+      ]
+    },
+    "dashboard_task_query": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/id"
+        },
+        "character": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "review": {
+          "$ref": "#/$defs/review_state"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "running",
+            "succeeded",
+            "failed",
+            "recovery_required"
+          ],
+          "description": "recovery_required filters failed tasks with recovery_required=true"
+        },
+        "q": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "utterance_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "page": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "page_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "additionalProperties": false
+    },
+    "task_summary": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "$ref": "#/$defs/id"
+        },
+        "project_id": {
+          "$ref": "#/$defs/id"
+        },
+        "utterance_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "character": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "running",
+            "succeeded",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "phase": {
+          "$ref": "#/$defs/phase"
+        },
+        "voice_source": {
+          "enum": [
+            "world",
+            "project_candidate"
+          ]
+        },
+        "voice_label": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "take_index": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "take_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "shot_window_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "clipping",
+              "true_peak_over",
+              "transcript_mismatch",
+              "window_overrun"
+            ]
+          }
+        },
+        "archive": {
+          "enum": [
+            "not_archived",
+            "archived",
+            "archived_link_pending"
+          ]
+        },
+        "review": {
+          "$ref": "#/$defs/review_state"
+        },
+        "error_code": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "elapsed_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "recovery_required": {
+          "type": "boolean",
+          "description": "true only for failed tasks whose upstream outcome is unknown; never auto-resubmitted"
+        }
+      },
+      "required": [
+        "task_id",
+        "project_id",
+        "utterance_id",
+        "text",
+        "status",
+        "recovery_required",
+        "phase",
+        "voice_source",
+        "take_index",
+        "take_count",
+        "archive",
+        "review",
+        "created_at",
+        "elapsed_seconds"
+      ],
+      "additionalProperties": false,
+      "if": {
+        "properties": {
+          "recovery_required": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "failed"
+          }
+        }
+      }
+    },
+    "task_list_result": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/task_summary"
+          }
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "page": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "page_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "items",
+        "total",
+        "page",
+        "page_size"
+      ],
+      "additionalProperties": false
+    },
+    "review_write": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/id"
+        },
+        "task_id": {
+          "$ref": "#/$defs/id"
+        },
+        "expected_revision_id": {
+          "$ref": "#/$defs/id"
+        },
+        "decision": {
+          "enum": [
+            "selected",
+            "needs_revision"
+          ]
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 1000
+        }
+      },
+      "required": [
+        "project_id",
+        "task_id",
+        "expected_revision_id",
+        "decision"
+      ],
+      "if": {
+        "properties": {
+          "decision": {
+            "const": "needs_revision"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "note"
+        ],
+        "properties": {
+          "note": {
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!\\.vf(?:/|$))(?!.*[. ](?:/|$))(?!.*\\/$)[^\\u0000-\\u001f\\u007f\\\\<>:\"|?*]+$"
+    },
+    "engine_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "service_id",
+        "engine",
+        "model_manifest_sha256",
+        "result"
+      ],
+      "properties": {
+        "service_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "engine": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "model_manifest_sha256": {
+          "$ref": "#/$defs/hash"
+        },
+        "result": {
+          "enum": [
+            "passed",
+            "partial",
+            "failed"
+          ]
+        },
+        "verified_at": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      }
+    },
+    "reference_voice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "label",
+        "speaker",
+        "language",
+        "reference",
+        "engines",
+        "consent",
+        "audition"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "reference-voice"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "speaker": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "language": {
+          "const": "zh-CN"
+        },
+        "reference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256",
+            "sample_rate_hz",
+            "duration_seconds"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/relativePath"
+            },
+            "sha256": {
+              "$ref": "#/$defs/hash"
+            },
+            "sample_rate_hz": {
+              "type": "integer",
+              "minimum": 16000,
+              "maximum": 48000
+            },
+            "duration_seconds": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 15
+            },
+            "source_range_seconds": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "start",
+                "end"
+              ],
+              "properties": {
+                "start": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "end": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                }
+              }
+            },
+            "processing": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "content_ref": {
+              "$ref": "#/$defs/content_ref"
+            }
+          }
+        },
+        "engines": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/engine_binding"
+          }
+        },
+        "consent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source_kind",
+            "basis",
+            "scope",
+            "recorded_at"
+          ],
+          "properties": {
+            "source_kind": {
+              "enum": [
+                "human_recording",
+                "voice_design",
+                "synthetic"
+              ]
+            },
+            "basis": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "scope": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "evidence_path": {
+              "$ref": "#/$defs/relativePath"
+            },
+            "recorded_at": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            }
+          },
+          "if": {
+            "properties": {
+              "source_kind": {
+                "const": "human_recording"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "evidence_path"
+            ]
+          }
+        },
+        "audition": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "text",
+            "technical_status",
+            "listening_review"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/relativePath"
+            },
+            "text": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "technical_status": {
+              "enum": [
+                "passed",
+                "failed"
+              ]
+            },
+            "listening_review": {
+              "enum": [
+                "pending",
+                "approved",
+                "rejected"
+              ]
+            }
+          }
+        },
+        "design": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "prompt",
+            "engine",
+            "parameters"
+          ],
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "engine": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "parameters": {
+              "type": "object"
+            }
+          }
+        },
+        "voice_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        },
+        "engine": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "model_manifest_sha256": {
+          "$ref": "#/$defs/hash"
+        },
+        "candidate_state": {
+          "enum": [
+            "candidate",
+            "selected"
+          ]
+        },
+        "listening_review": {
+          "enum": [
+            "pending",
+            "approved",
+            "rejected"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "consent": {
+            "type": "object",
+            "properties": {
+              "source_kind": {
+                "const": "voice_design"
+              }
+            },
+            "required": [
+              "source_kind"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "design"
+        ]
+      }
     }
   }
 }

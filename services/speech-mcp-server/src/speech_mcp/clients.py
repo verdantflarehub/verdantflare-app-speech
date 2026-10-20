@@ -54,10 +54,17 @@ class Client:
                     if len(raw) <= 4096:
                         try:
                             err = strict_json(raw).get("error", {})
-                            if isinstance(err, dict) and err.get("code") in ("model_version_changed", "recovery_required", "idempotency_conflict"):
+                            if isinstance(err, dict) and err.get("code") in (
+                                "model_version_changed",
+                                "recovery_required",
+                                "idempotency_conflict",
+                                "unverified_voice_engine",
+                            ):
                                 raise Failure(err["code"], 409)
                         except (AttributeError, ValueError):
                             pass
+                    if r.status_code == 409:
+                        raise Failure("revision_conflict", 409)
                     if r.status_code in (400, 413, 415, 422):
                         raise Failure("dependency_rejected_input", 400)
                     if r.status_code == 404:
@@ -77,18 +84,26 @@ class Client:
 
 
 class Peers:
-    def __init__(self, project, artifact, runtime):
-        self.project, self.artifact, self.runtime = project, artifact, runtime
+    def __init__(self, project, artifact, runtime, world=None):
+        self.project, self.artifact, self.runtime, self.world = project, artifact, runtime, world
 
     @classmethod
     def environment(cls):
-        return cls(Client(os.environ["SPEECH_PROJECT_URL"], token("SPEECH_PROJECT_TOKEN"), os.environ["SPEECH_PLATFORM_CA_FILE"]),
-                   Client(os.environ["SPEECH_ARTIFACT_URL"], token("SPEECH_ARTIFACT_TOKEN"), os.environ["SPEECH_PLATFORM_CA_FILE"]),
-                   Client(os.environ["SPEECH_RUNTIME_URL"], token("SPEECH_RUNTIME_TOKEN"), allow_http=True))
+        ca = os.environ["SPEECH_PLATFORM_CA_FILE"]
+        world = None
+        if os.environ.get("SPEECH_WORLD_URL"):
+            world = Client(os.environ["SPEECH_WORLD_URL"], token("SPEECH_WORLD_TOKEN"), ca)
+        return cls(
+            Client(os.environ["SPEECH_PROJECT_URL"], token("SPEECH_PROJECT_TOKEN"), ca),
+            Client(os.environ["SPEECH_ARTIFACT_URL"], token("SPEECH_ARTIFACT_TOKEN"), ca),
+            Client(os.environ["SPEECH_RUNTIME_URL"], token("SPEECH_RUNTIME_TOKEN"), allow_http=True),
+            world=world,
+        )
 
     async def close(self):
-        for c in (self.project, self.artifact, self.runtime):
-            await c.close()
+        for c in (self.project, self.artifact, self.runtime, self.world):
+            if c is not None:
+                await c.close()
 
     async def open(self, p, project_id, revision_id=None, write=False):
         args = {"project_id": project_id}
@@ -104,10 +119,25 @@ class Peers:
     def files(opened):
         return opened["manifest"]["files"]
 
+    @staticmethod
+    def asset_refs(opened):
+        return opened.get("manifest", {}).get("asset_refs") or []
+
     @classmethod
     def contains(cls, opened, ref):
         if not any(f["content_ref"] == ref for f in cls.files(opened)):
             raise Failure("reference_outside_revision", 403)
+
+    @classmethod
+    def contains_asset_ref(cls, opened, asset_id, version_id):
+        refs = opened.get("manifest", {}).get("asset_refs")
+        if refs is None:
+            return
+        for item in refs:
+            item_ver = item.get("asset_version_id") or item.get("version_id")
+            if item.get("asset_id") == asset_id and item_ver == version_id:
+                return
+        raise Failure("reference_outside_revision", 403)
 
     async def content(self, p, ref, project_id, revision_id, limit):
         validate("content_ref", ref)
@@ -122,12 +152,105 @@ class Peers:
             raise Failure("reference_integrity_failed", 502)
         return data, meta
 
+    async def asset_content(self, p, ref, asset_id, asset_version_id, limit):
+        validate("content_ref", ref)
+        query = urlencode({"store_id": ref["store_id"], "artifact_id": ref["artifact_id"],
+                           "asset_id": asset_id, "asset_version_id": asset_version_id})
+        path = "/v2/artifacts/" + ref["version_id"]
+        meta = await self.artifact.json(p, "GET", path + "?" + query)
+        if meta.get("size", limit + 1) > limit or any(meta.get(k) != v for k, v in ref.items()):
+            raise Failure("invalid_reference_metadata")
+        data = await self.artifact.request(p, "GET", path + "/content?" + query, limit=limit)
+        if digest(data) != meta.get("sha256") or len(data) != meta["size"]:
+            raise Failure("reference_integrity_failed", 502)
+        return data, meta
+
+    async def task_output_content(self, p, ref, project_id, limit):
+        validate("content_ref", ref)
+        query = urlencode({"store_id": ref["store_id"], "artifact_id": ref["artifact_id"]})
+        path = "/v2/artifacts/" + ref["version_id"]
+        meta = await self.artifact.json(p, "GET", path + "?" + query, project_id=project_id)
+        if meta.get("size", limit + 1) > limit or any(meta.get(k) != v for k, v in ref.items()):
+            raise Failure("invalid_reference_metadata")
+        data = await self.artifact.request(p, "GET", path + "/content?" + query, project_id=project_id, limit=limit)
+        if digest(data) != meta.get("sha256") or len(data) != meta["size"]:
+            raise Failure("reference_integrity_failed", 502)
+        return data, meta
+
     async def profile(self, p, opened, project_id, revision_id, ref):
         self.contains(opened, ref)
         raw, _ = await self.content(p, ref, project_id, revision_id, 16384)
         profile = validate("profile", strict_json(raw))
         self.contains(opened, profile["reference"]["content_ref"])
         return profile, digest(raw)
+
+    async def lexicon(self, p, opened, project_id, revision_id, ref):
+        self.contains(opened, ref)
+        raw, _ = await self.content(p, ref, project_id, revision_id, 65536)
+        doc = validate("lexicon", strict_json(raw))
+        return doc, digest(raw)
+
+    async def world_voice(self, p, opened, world_ref, engine="indextts2", model_manifest_sha256=None, check_boundary=True):
+        validate("world_voice", world_ref)
+        asset_id = world_ref["asset_id"]
+        version_id = world_ref.get("version_id") or world_ref.get("asset_version_id")
+        if check_boundary and opened is not None:
+            self.contains_asset_ref(opened, asset_id, version_id)
+        if self.world is None:
+            raise Failure("dependency_unavailable", 503, True)
+        asset = await self.world.json(
+            p, "POST", "/internal/v1/world/get",
+            {"asset_id": asset_id, "asset_version_id": version_id},
+        )
+        manifest = asset.get("manifest") or {}
+        files = manifest.get("files") or []
+        by_path = {f.get("path"): f for f in files if isinstance(f, dict) and f.get("path")}
+        rv_entry = by_path.get("reference-voice.json")
+        if not rv_entry or not rv_entry.get("content_ref"):
+            raise Failure("invalid_reference_voice", 400)
+        raw, _ = await self.asset_content(p, rv_entry["content_ref"], asset_id, version_id, 65536)
+        rv_doc = validate("reference_voice", strict_json(raw))
+        # Verify audition file is present in manifest without reading consent.evidence_path.
+        audition_path = rv_doc["audition"]["path"]
+        if audition_path not in by_path or rv_doc["audition"]["technical_status"] != "passed":
+            raise Failure("invalid_reference_voice", 400)
+        ref_path = rv_doc["reference"]["path"]
+        ref_entry = by_path.get(ref_path)
+        if not ref_entry or not ref_entry.get("content_ref"):
+            raise Failure("invalid_reference_voice", 400)
+        binding = next(
+            (b for b in rv_doc["engines"]
+             if b.get("service_id") == "speech" and b.get("engine") == engine and b.get("result") == "passed"),
+            None,
+        )
+        if binding is None:
+            raise Failure("unverified_voice_engine", 400)
+        if model_manifest_sha256 and binding["model_manifest_sha256"] != model_manifest_sha256:
+            raise Failure("model_version_changed", 409)
+        voice_id = rv_doc.get("voice_id") or ("world-" + asset_id[:8])
+        profile = {
+            "schema_version": 1,
+            "voice_id": voice_id,
+            "label": rv_doc["label"],
+            "speaker": rv_doc["speaker"],
+            "engine": engine,
+            "model_manifest_sha256": binding["model_manifest_sha256"],
+            "reference": {
+                "content_ref": ref_entry["content_ref"],
+                "sha256": rv_doc["reference"]["sha256"],
+                "asset_id": asset_id,
+                "asset_version_id": version_id,
+            },
+            "candidate_state": rv_doc.get("candidate_state", "selected"),
+            "listening_review": rv_doc["audition"]["listening_review"],
+        }
+        voice_source = {
+            "kind": "world",
+            "world_voice": {"asset_id": asset_id, "version_id": version_id},
+            "reference_sha256": rv_doc["reference"]["sha256"],
+        }
+        return profile, voice_source, rv_doc
+
 
     async def archive(self, p, row, entry, data):
         source = {"kind": "task_output", "project_id": row["project_id"], "service_id": "speech",

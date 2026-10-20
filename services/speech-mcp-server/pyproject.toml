@@ -1,7 +1,7 @@
 [project]
 name = "verdantflare-speech-mcp-server"
-version = "0.1.6"
-description = "Durable Studio speech tasks and native Artifact delivery"
+version = "0.2.0"
+description = "Durable Studio speech tasks, Dashboard API, and native Artifact delivery"
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "fastapi==0.115.12",
@@ -19,4 +19,4 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-speech_mcp = ["contract.json", "schema.sql"]
+speech_mcp = ["contract.json", "schema.sql", "dashboard_src/*"]

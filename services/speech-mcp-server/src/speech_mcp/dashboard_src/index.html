@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>VerdantFlare Studio · Speech MCP</title>
+  <link rel="stylesheet" href="./dashboard.css">
+</head>
+
+<body data-theme="light">
+  <div id="speechAppRoot" class="studio-workspace">
+    <div id="backoffBanner" class="backoff-banner" role="status" hidden>
+      <div>
+        <strong id="backoffTitle">任务轮询退避重连中（Attempt 1/3）</strong>
+        <div id="backoffDesc" class="backoff-timer" style="margin-top:2px">下次重试等待 1.0s（±15% Jitter）· 已保留最近一次可信任务列表</div>
+      </div>
+      <button type="button" id="btnResetBackoff" class="primary">立即重连</button>
+    </div>
+
+    <nav class="breadcrumb" aria-label="面包屑">
+      <a href="/tasks" data-route="/tasks">Speech MCP</a>
+      <span aria-hidden="true">/</span>
+      <span id="crumbCurrent" aria-current="page">任务</span>
+    </nav>
+
+    <header id="appHeader" class="studio-app-heading">
+      <div>
+        <h1>Speech MCP</h1>
+        <p>逐句生成对白与旁白，复用 World 声线；技术结果、项目归档、声线选用与人工听审分开记录。</p>
+      </div>
+      <div class="creation-actions">
+        <span class="physics-pill">生成经 Skill / MCP 发起 · MCP Token 即调用授权</span>
+      </div>
+    </header>
+
+    <nav id="appTabs" class="studio-app-tabs" aria-label="Speech 菜单">
+      <a data-app-tab="tasks" data-route="/tasks" href="/tasks" class="active" aria-current="page">任务</a>
+      <a data-app-tab="models" data-route="/models" href="/models">模型</a>
+      <a data-app-tab="mcp" data-route="/mcp" href="/mcp">MCP</a>
+    </nav>
+
+    <main class="studio-app-content">
+      <section id="tasks">
+        <div class="task-actions">
+          <div class="sync-meta">
+            <span id="syncText" class="num">刚刚同步 · 自动刷新</span>
+            <button type="button" id="refreshTasks" aria-label="刷新任务">↻ 刷新</button>
+            <details class="duration-note">
+              <summary id="avgDurationSummary" class="num">平均耗时 — ⓘ</summary>
+              <p>含 GPU Lease 排队、冷启动加载与实际推理耗时（queue_seconds + load_seconds + inference_seconds）。</p>
+            </details>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <label class="search-wrap">
+            <span aria-hidden="true">⌕</span>
+            <input id="search" type="search" aria-label="搜索任务" placeholder="搜索台词、角色、utterance_id 或声线">
+            <span id="imeBadge" class="ime-badge">CJK 守卫</span>
+          </label>
+          <select id="project" aria-label="所属项目">
+            <option value="all">全部项目</option>
+          </select>
+          <select id="character" aria-label="角色">
+            <option value="all">全部角色</option>
+          </select>
+          <select id="review" aria-label="听审状态">
+            <option value="all">全部听审状态</option>
+            <option value="pending">待听审</option>
+            <option value="selected">已选用</option>
+            <option value="needs_revision">需返修</option>
+          </select>
+          <div class="switch">
+            <button type="button" class="active" data-view="gallery">画廊</button>
+            <button type="button" data-view="table">列表</button>
+          </div>
+        </div>
+
+        <div class="statuses" id="statuses"></div>
+        <div id="gallery" class="gallery" data-roving-grid="true"></div>
+        <div id="table" class="table-wrap" hidden></div>
+        <div id="skeletonGrid" class="gallery" hidden>
+          <div class="skeleton-card"></div>
+          <div class="skeleton-card"></div>
+          <div class="skeleton-card"></div>
+        </div>
+        <div id="empty" class="empty" hidden>
+          <p style="margin-bottom:12px">没有匹配的配音任务。配音由 Speech Skill 或 MCP 客户端逐句发起。</p>
+          <button type="button" id="clearTaskFilters" class="primary">清除筛选</button>
+        </div>
+        <div class="pagination" id="count"></div>
+      </section>
+
+      <section id="taskDetailSection" hidden></section>
+
+      <section id="models" hidden>
+        <div style="margin-bottom:14px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+          <div>
+            <h2>模型与能力声明</h2>
+            <p>按渠道列出语音模型；能力、限制与不支持项直接读取 <code>speech.capabilities</code>，界面不展示无效控件。</p>
+          </div>
+          <span id="modelsCountPill" class="physics-pill num">本地 5090 · 1 项就绪</span>
+        </div>
+        <div id="modelGroups"></div>
+      </section>
+
+      <section id="mcp" hidden>
+        <div style="margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+          <div>
+            <h2>MCP 服务与能力目录</h2>
+            <p>统一经 Studio 受控入口（STUDIO_MCP_URL）访问；结果只返回 Artifact ContentRef，不返回下载 URL。</p>
+          </div>
+          <span class="physics-pill">3 组 5 项工具</span>
+        </div>
+        <div class="mcp-contract-strip" aria-label="Speech MCP 服务状态与接入契约">
+          <div class="mcp-kv">
+            <small>服务标识与运行状态</small>
+            <strong id="mcpServiceState">speech-mcp-server (v0.2.0) · <span style="color:var(--accent)">● 在线</span></strong>
+          </div>
+          <div class="mcp-kv">
+            <small>外部唯一受控入口</small>
+            <strong><code>STUDIO_MCP_URL</code>（下游 :8000 仅允许 Studio 访问）</strong>
+          </div>
+          <div class="mcp-kv">
+            <small>推理运行时</small>
+            <strong id="mcpRuntimeState" class="num">IndexTTS2 runtime · 按需唤醒 · GPU Lease 排队</strong>
+          </div>
+        </div>
+        <div id="mcpCapabilityCards" class="resource-grid"></div>
+      </section>
+    </main>
+  </div>
+  <script type="module" src="./dashboard.mjs"></script>
+</body>
+
+</html>

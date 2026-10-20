@@ -49,6 +49,87 @@ class Store:
             raise Failure("task_not_found", 404)
         return row
 
+    def get_by_id(self, p, task_id):
+        with self.connect() as c:
+            row = c.execute(
+                "SELECT * FROM speech_tasks WHERE task_id=%s AND organization_id=%s AND subject_id=%s",
+                (task_id, p["organization_id"], p["subject_id"]),
+            ).fetchone()
+        if not row:
+            raise Failure("task_not_found", 404)
+        return row
+
+    def list_for_principal(self, p, project_id=None):
+        with self.connect() as c:
+            if project_id:
+                return c.execute(
+                    "SELECT * FROM speech_tasks WHERE scope=%s ORDER BY created_at DESC LIMIT 500",
+                    (scope(p, project_id),),
+                ).fetchall()
+            return c.execute(
+                "SELECT * FROM speech_tasks WHERE organization_id=%s AND subject_id=%s ORDER BY created_at DESC LIMIT 500",
+                (p["organization_id"], p["subject_id"]),
+            ).fetchall()
+
+    def utterance_takes(self, p, project_id, utterance_id):
+        with self.connect() as c:
+            return c.execute(
+                "SELECT * FROM speech_tasks WHERE scope=%s AND request->>'utterance_id'=%s ORDER BY created_at ASC",
+                (scope(p, project_id), utterance_id),
+            ).fetchall()
+
+    def update_review(self, p, project_id, task_id, decision, note=None, reviewed_revision_id=None):
+        sc = scope(p, project_id)
+        with self.connect() as c:
+            row = c.execute(
+                "SELECT * FROM speech_tasks WHERE task_id=%s AND scope=%s FOR UPDATE",
+                (task_id, sc),
+            ).fetchone()
+            if not row:
+                raise Failure("task_not_found", 404)
+            if row["status"] != "succeeded":
+                raise Failure("result_not_ready", 409)
+            utterance_id = row["request"].get("utterance_id")
+            if decision == "selected" and utterance_id:
+                siblings = c.execute(
+                    "SELECT * FROM speech_tasks WHERE scope=%s AND request->>'utterance_id'=%s AND task_id<>%s FOR UPDATE",
+                    (sc, utterance_id, task_id),
+                ).fetchall()
+                for sib in siblings:
+                    sib_state = dict(sib["state"])
+                    if sib_state.get("candidate_state") == "selected" or sib_state.get("review_state") == "selected":
+                        sib_state["candidate_state"] = "candidate"
+                        if sib_state.get("review_state") == "selected":
+                            sib_state["review_state"] = "pending"
+                        if isinstance(sib_state.get("generation"), dict):
+                            sib_state["generation"]["candidate_state"] = "candidate"
+                        c.execute(
+                            "UPDATE speech_tasks SET state=%s, updated_at=now() WHERE task_id=%s AND scope=%s",
+                            (Jsonb(sib_state), sib["task_id"], sc),
+                        )
+            state = dict(row["state"])
+            if decision == "selected":
+                state["review_state"] = "selected"
+                state["candidate_state"] = "selected"
+                state["listening_review"] = "approved"
+                state["review"] = "approved"
+            else:
+                state["review_state"] = "needs_revision"
+                state["candidate_state"] = "candidate"
+                state["listening_review"] = "rejected"
+                state["review"] = "rejected"
+            state["review_note"] = note or ""
+            if reviewed_revision_id:
+                state["reviewed_revision_id"] = reviewed_revision_id
+            if isinstance(state.get("generation"), dict):
+                state["generation"]["candidate_state"] = state["candidate_state"]
+                state["generation"]["listening_review"] = state["listening_review"]
+            updated = c.execute(
+                "UPDATE speech_tasks SET state=%s, updated_at=now() WHERE task_id=%s AND scope=%s RETURNING *",
+                (Jsonb(state), task_id, sc),
+            ).fetchone()
+        return updated
+
     def claim(self):
         with self.connect() as c:
             return c.execute("""WITH candidate AS (
