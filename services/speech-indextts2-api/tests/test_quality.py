@@ -83,7 +83,8 @@ class Report(unittest.TestCase):
         import json
         from pathlib import Path
         from jsonschema import Draft202012Validator
-        contract = json.loads((Path(__file__).parents[1] / "src/speech_runtime/contract.json").read_text())
+        import speech_runtime.audio as audio
+        contract = json.loads(Path(audio.__file__).with_name("contract.json").read_text())
         schema = dict(contract, **{"$ref": "#/$defs/audio_report"})
         schema.pop("oneOf", None)
         buffer = io.BytesIO()
