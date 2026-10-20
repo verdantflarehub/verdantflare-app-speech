@@ -76,10 +76,16 @@ class Worker:
         p, req, state = row["principal"], row["request"], row["state"]
         pid, phase = row["project_id"], row["phase"]
         await self.peers.open(p, pid, write=True)
-        if phase in ("submit", "inference"):
+        if phase in ("reference", "submit", "inference"):
             await self._ensure_gpu(row)
         if phase == "reference":
             profile = state["profile"]
+            caps = await self.peers.runtime.json(p, "GET", "/v1/capabilities", project_id=pid)
+            if caps.get("model_manifest_sha256") != profile["model_manifest_sha256"]:
+                raise Failure("model_version_changed", 409)
+            if caps.get("ready") is not True:
+                raise Failure("model_not_ready", 503, True)
+            state["capabilities"] = caps
             data, _ = await self.peers.content(p, profile["reference"]["content_ref"], pid, req["revision_id"], 2 << 20)
             if digest(data) != profile["reference"]["sha256"]:
                 raise Failure("reference_integrity_failed")

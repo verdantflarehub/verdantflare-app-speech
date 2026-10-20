@@ -2,6 +2,7 @@ import copy
 from datetime import datetime, timezone
 import unittest
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 import httpx
 
@@ -98,6 +99,52 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             await self.svc.call("speech.status", args, self.p | {"subject_id": new_id()})
         self.peers.open.side_effect = Failure("permission_denied", 403)
         with self.assertRaises(Failure): await self.svc.call("speech.status", args, self.p)
+
+    async def test_managed_cold_start_accepts_once_without_runtime_access(self):
+        self.svc.gpu = SimpleNamespace(enabled=True)
+        self.peers.runtime.json.side_effect = Failure("dependency_unavailable", 503, True)
+        first = await self.svc.call("speech.create", self.req, self.p)
+        second = await self.svc.call("speech.create", self.req, self.p)
+        self.assertEqual(first["task_id"], second["task_id"])
+        self.peers.runtime.json.assert_not_awaited()
+        self.peers.content.assert_awaited_once()
+        self.assertIsNone(self.store.row["state"]["capabilities"])
+
+    async def test_managed_cold_start_still_rejects_bad_reference(self):
+        self.svc.gpu = SimpleNamespace(enabled=True)
+        self.peers.content.return_value = (b"wrong audio", {"mime": "audio/wav"})
+        with self.assertRaisesRegex(Failure, "reference_integrity_failed"):
+            await self.svc.call("speech.create", self.req, self.p)
+        self.assertIsNone(self.store.prior)
+        self.peers.runtime.json.assert_not_awaited()
+
+    async def test_reference_wakes_before_upload_and_records_real_capabilities(self):
+        worker = Worker(self.svc)
+        events = []
+        async def wake(row): events.append("lease-and-ready")
+        worker._ensure_gpu = wake
+        async def runtime(p, method, path, **kw):
+            events.append(path)
+            if path == "/v1/capabilities":
+                return {"ready": True, "model_manifest_sha256": "a" * 64, "observed": True}
+            return {}
+        self.peers.runtime.json.side_effect = runtime
+        self.row["state"]["capabilities"] = None
+        await worker.step(self.row)
+        self.assertEqual(events, ["lease-and-ready", "/v1/capabilities", "/v1/references/" + digest(b"audio")])
+        self.assertEqual(self.store.row["phase"], "submit")
+        self.assertTrue(self.store.row["state"]["capabilities"]["observed"])
+
+    async def test_reference_blocks_upload_until_ready_and_matching_model(self):
+        worker = Worker(self.svc)
+        worker._ensure_gpu = AsyncMock()
+        for caps, error in [({"ready": False, "model_manifest_sha256": "a" * 64}, "model_not_ready"),
+                            ({"ready": True, "model_manifest_sha256": "c" * 64}, "model_version_changed")]:
+            self.peers.runtime.json.reset_mock()
+            self.peers.runtime.json.return_value = caps
+            with self.assertRaisesRegex(Failure, error): await worker.step(self.row)
+            self.peers.runtime.json.assert_awaited_once()
+        self.assertEqual(self.store.saves, 0)
 
     async def test_submission_response_loss_reuses_original_key(self):
         worker = Worker(self.svc)

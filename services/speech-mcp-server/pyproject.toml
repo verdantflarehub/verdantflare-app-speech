@@ -1,6 +1,6 @@
 [project]
 name = "verdantflare-speech-mcp-server"
-version = "0.1.5"
+version = "0.1.6"
 description = "Durable Studio speech tasks and native Artifact delivery"
 requires-python = ">=3.11,<3.14"
 dependencies = [

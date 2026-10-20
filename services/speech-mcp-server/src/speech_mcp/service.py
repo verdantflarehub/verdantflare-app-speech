@@ -76,11 +76,16 @@ class Service:
         audio, meta = await self.peers.content(p, profile["reference"]["content_ref"], pid, args["revision_id"], 2 << 20)
         if digest(audio) != profile["reference"]["sha256"] or meta["mime"] not in ("audio/wav", "audio/x-wav"):
             raise Failure("reference_integrity_failed")
-        caps = await self.peers.runtime.json(p, "GET", "/v1/capabilities", project_id=pid)
-        if caps.get("model_manifest_sha256") != self.model_hash:
-            raise Failure("model_version_changed", 409)
-        if not caps.get("ready"):
-            raise Failure("model_not_ready", 503, True)
+        # A managed runtime may be scaled to zero. Persist validated work first;
+        # the worker owns its lease, startup and actual model verification.
+        # None is intentional: configuration is not an observed capability report.
+        caps = None
+        if not self.gpu.enabled:
+            caps = await self.peers.runtime.json(p, "GET", "/v1/capabilities", project_id=pid)
+            if caps.get("model_manifest_sha256") != self.model_hash:
+                raise Failure("model_version_changed", 409)
+            if not caps.get("ready"):
+                raise Failure("model_not_ready", 503, True)
         state = {"profile": profile, "profile_sha256": sha, "capabilities": caps, "outputs": []}
         return public(await asyncio.to_thread(self.store.create, p, args, state))
 
