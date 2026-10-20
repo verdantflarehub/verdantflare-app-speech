@@ -203,7 +203,13 @@ def _build_whisper_model(dims: _ModelDimensions):
 
     class LayerNorm(nn.LayerNorm):
         def forward(self, x):
-            return super().forward(x.float()).type(x.dtype)
+            return F.layer_norm(
+                x.float(),
+                self.normalized_shape,
+                None if self.weight is None else self.weight.float(),
+                None if self.bias is None else self.bias.float(),
+                self.eps,
+            ).type(x.dtype)
 
     class Linear(nn.Linear):
         def forward(self, x):
@@ -340,6 +346,7 @@ class WhisperSmallASR:
     def load(self) -> bool:
         started = time.monotonic()
         try:
+            os.environ.setdefault("PYTORCH_KERNEL_CACHE_PATH", "/tmp/torch-kernels")
             verify_asr_models(self.root)
             import numpy as np
             import torch

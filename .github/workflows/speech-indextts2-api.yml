@@ -15,7 +15,7 @@ concurrency:
 env:
   REGISTRY_ENDPOINT: ${{ secrets.REGISTRY_ENDPOINT_ALIYUN }}
   IMAGE_NAME: wod/verdantflare-app
-  IMAGE_VERSION: speech-indextts2-api-v0.1.5
+  IMAGE_VERSION: speech-indextts2-api-v0.1.6
 jobs:
   image:
     name: Build and publish speech runtime
