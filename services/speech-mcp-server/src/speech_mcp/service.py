@@ -95,20 +95,3 @@ class Service:
         except Exception:
             return "connect_failed"
         return "connect_failed"
-
-    async def authorize(self, p, permission):
-        if not isinstance(permission, dict) or set(permission) != {"action", "source"} or permission["action"] != "write":
-            raise Failure("permission_denied", 403)
-        source = permission["source"]
-        if not isinstance(source, dict) or set(source) != {"kind", "service_id", "project_id", "task_id", "run_id"}:
-            raise Failure("permission_denied", 403)
-        if source["kind"] != "task_output" or source["service_id"] != "speech":
-            raise Failure("permission_denied", 403)
-        for key in ("project_id", "task_id", "run_id"):
-            validate("id", source[key])
-        row = await asyncio.to_thread(self.store.get, p, source["project_id"], source["task_id"])
-        if (row["phase"] not in ("archive", "complete") or row["status"] not in ("running", "succeeded") or
-                row["state"].get("runtime_task_id") != source["run_id"] or not row["state"].get("archive_entries")):
-            raise Failure("permission_denied", 403)
-        await self.peers.open(p, row["project_id"], write=True)
-        return {"allowed": True}

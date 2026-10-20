@@ -99,17 +99,6 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.peers.open.side_effect = Failure("permission_denied", 403)
         with self.assertRaises(Failure): await self.svc.call("speech.status", args, self.p)
 
-    async def test_authority_only_permits_real_archive_task(self):
-        source = dict(kind="task_output", service_id="speech", project_id=self.row["project_id"],
-                      task_id=self.row["task_id"], run_id=new_id())
-        permission = dict(action="write", source=source)
-        with self.assertRaises(Failure): await self.svc.authorize(self.p, permission)
-        self.row.update(phase="archive", status="running")
-        self.row["state"].update(runtime_task_id=source["run_id"], archive_entries=[{"write_id": new_id()}])
-        self.assertEqual(await self.svc.authorize(self.p, permission), {"allowed": True})
-        for bad in (permission | {"action": "read"}, permission | {"version": {}}, dict(action="write", source=source | {"run_id": new_id()})):
-            with self.assertRaises(Failure): await self.svc.authorize(self.p, bad)
-
     async def test_submission_response_loss_reuses_original_key(self):
         worker = Worker(self.svc)
         self.row.update(phase="submit")
@@ -163,20 +152,19 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.row["status"], "failed")
         self.assertEqual(self.store.row["last_error"], "recovery_required")
 
-    async def test_mcp_and_authority_ports_are_separate(self):
-        mcp, auth = applications(self.svc, "m" * 32, "a" * 32, start_worker=False)
+    async def test_mcp_boundary_and_retired_authority_route(self):
+        mcp = applications(self.svc, "m" * 32, start_worker=False)
         headers = {"Authorization": "Bearer " + "m" * 32,
                    "X-Organization-Id": self.p["organization_id"], "X-User-Id": self.p["subject_id"],
                    "X-Request-Id": self.p["request_id"]}
         body = {"jsonrpc": "2.0", "id": self.p["request_id"], "method": "tools/call",
                 "params": {"name": "speech.capabilities", "arguments": {}}}
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=mcp), base_url="https://test") as c:
+            self.assertEqual((await c.get("/health")).status_code, 200)
             self.assertEqual((await c.post("/mcp", json=body)).status_code, 401)
             self.assertEqual((await c.post("/mcp", json=body, headers=headers)).status_code, 200)
             self.assertEqual((await c.post("/mcp", json=body, headers=headers | {"X-Project-Id": new_id()})).status_code, 400)
             self.assertEqual((await c.post("/internal/artifacts/authorize", json={}, headers=headers)).status_code, 404)
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=auth), base_url="https://test") as c:
-            self.assertEqual((await c.post("/mcp", json=body, headers={"Authorization": "Bearer " + "a" * 32})).status_code, 404)
 
     async def test_internal_client_rejects_redirects_and_checks_digest(self):
         seen = []

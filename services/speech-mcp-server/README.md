@@ -6,9 +6,9 @@ Studio-only speech tools, PostgreSQL task recovery and native Artifact output de
 
 ## 2. Runtime
 
-Python 3.11, HTTP MCP on 8000 and separate HTTPS producer authority on 8001. Startup applies additive database DDL with an advisory transaction lock. The service requires its own database/role, internal credentials, TLS key pair and trusted platform CA. It never loads GPU weights, accepts arbitrary source URLs, forwards user bearers or writes S3 directly.
+Python 3.11, HTTP MCP and `/health` on 8000, unilateral HTTPS client to Station Artifact (`:8094`) and Project (`:8096`). Startup applies additive database DDL with an advisory transaction lock. The service requires its own database/role, internal credentials and trusted platform CA. It never exposes reverse Artifact callbacks, loads GPU weights, accepts arbitrary source URLs, forwards user bearers or writes S3 directly.
 
-Configure `SPEECH_DATABASE_URL`, `SPEECH_MCP_TOKEN`, `SPEECH_AUTHORITY_TOKEN`, `SPEECH_PROJECT_URL/TOKEN`, `SPEECH_ARTIFACT_URL/TOKEN`, `SPEECH_RUNTIME_URL/TOKEN`, `SPEECH_PLATFORM_CA_FILE`, `SPEECH_TLS_CERT_FILE`, `SPEECH_TLS_KEY_FILE`, `SPEECH_MODEL_MANIFEST_SHA256`, `ETCD_ENDPOINTS` and `MCP_SERVICE_ENDPOINT` through controlled deployment configuration.
+Configure `SPEECH_DATABASE_URL`, `SPEECH_MCP_TOKEN`, `SPEECH_PROJECT_URL/TOKEN`, `SPEECH_ARTIFACT_URL/TOKEN`, `SPEECH_RUNTIME_URL/TOKEN`, `SPEECH_PLATFORM_CA_FILE`, `SPEECH_MODEL_MANIFEST_SHA256`, `ETCD_ENDPOINTS` and `MCP_SERVICE_ENDPOINT` through controlled deployment configuration.
 
 ## 3. Verification
 

@@ -11,9 +11,9 @@ from .domain import Failure, TOOLS, canonical, principal, strict_json
 from .worker import Worker
 
 
-def applications(service, mcp_token, authority_token, registry=None, start_worker=True):
-    if mcp_token == authority_token or any(len(t) < 32 or any(c.isspace() for c in t) for t in (mcp_token, authority_token)):
-        raise RuntimeError("distinct_credentials_required")
+def applications(service, mcp_token, registry=None, start_worker=True):
+    if len(mcp_token) < 32 or any(c.isspace() for c in mcp_token):
+        raise RuntimeError("invalid_service_credential")
 
     @asynccontextmanager
     async def lifespan(app):
@@ -32,7 +32,6 @@ def applications(service, mcp_token, authority_token, registry=None, start_worke
         await service.peers.close()
 
     mcp = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
-    authority = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
     def install(app, credential):
         @app.middleware("http")
@@ -53,7 +52,6 @@ def applications(service, mcp_token, authority_token, registry=None, start_worke
             return JSONResponse({"error": {"code": error.code}}, status_code=error.status)
 
     install(mcp, mcp_token)
-    install(authority, authority_token)
 
     async def read(request):
         if request.headers.get("content-type", "").split(";", 1)[0] != "application/json":
@@ -72,10 +70,6 @@ def applications(service, mcp_token, authority_token, registry=None, start_worke
         except Exception:
             return JSONResponse({"ready": False}, status_code=503)
         return {"ready": True, "version": __version__}
-
-    @authority.get("/health")
-    async def authority_health():
-        return {"ready": True}
 
     @mcp.post("/mcp")
     async def rpc(request: Request):
@@ -115,17 +109,4 @@ def applications(service, mcp_token, authority_token, registry=None, start_worke
             raise Failure("method_not_found", 404)
         return {"jsonrpc": "2.0", "id": body["id"], "result": result}
 
-    @authority.post("/internal/artifacts/authorize")
-    async def authorize(request: Request):
-        try:
-            body = await read(request)
-            if not isinstance(body, dict) or set(body) != {"principal", "permission"}:
-                raise Failure("permission_denied", 403)
-            p = principal(body["principal"])
-            return await service.authorize(p, body["permission"])
-        except Failure as error:
-            return JSONResponse({"allowed": False}, status_code=503 if error.status >= 500 else 403)
-        except Exception:
-            return JSONResponse({"allowed": False}, status_code=503)
-
-    return mcp, authority
+    return mcp
