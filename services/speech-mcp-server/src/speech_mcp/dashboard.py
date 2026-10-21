@@ -89,7 +89,7 @@ def summarize_row(row, take_index=1, take_count=1):
         "created_at": row["created_at"].isoformat(),
         "elapsed_seconds": _elapsed_seconds(row),
     }
-    character = profile.get("speaker") or profile.get("label") or profile.get("voice_id")
+    character = req.get("character") or profile.get("speaker") or profile.get("label") or profile.get("voice_id")
     if character:
         summary["character"] = str(character)[:128]
     label = profile.get("label") or profile.get("voice_id")
@@ -150,7 +150,7 @@ class DashboardAPI:
             "engines": [rt["capability"]],
             "tools": TOOLS,
             "filters": {"projects": projects, "characters": characters},
-            "recent_tasks": summaries[:50],
+            "recent_tasks": summaries[:500],
         }
 
     async def query_tasks(self, p, query=None):
