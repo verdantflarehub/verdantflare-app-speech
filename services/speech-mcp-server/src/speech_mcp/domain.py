@@ -22,6 +22,13 @@ class Failure(Exception):
         self.code, self.status, self.retry = code, status, retry
 
 
+class TaskNotFound(Failure):
+    def __init__(self, code="task_not_found", status=404, retry=False):
+        actual_code = "task_not_found" if (str(code).startswith("NOT_FOUND") or ":" in str(code) or " " in str(code)) else str(code)
+        super().__init__(actual_code, status=status, retry=retry)
+        self.detail = str(code)
+
+
 def new_id():
     return str(uuid.UUID(int=(int(time.time() * 1000) << 80) | (7 << 76) |
                          (secrets.randbits(12) << 64) | (2 << 62) | secrets.randbits(62)))
@@ -51,6 +58,10 @@ def strict_json(data):
 
 
 def validate(kind, value):
+    if kind == "rate_content":
+        if not isinstance(value, dict):
+            raise Failure("invalid_arguments")
+        return value
     schema = {"$ref": "#/$defs/" + kind, "$defs": CONTRACT["$defs"]}
     if not Draft202012Validator(schema).is_valid(value):
         raise Failure("invalid_arguments")
@@ -204,13 +215,16 @@ DESCRIPTIONS = {
     "create": "Generate one Chinese dialogue or narration take using a pinned World reference voice or project voice profile.",
     "status": "Recover the original speech task, phase, timings, and review state. Do not resubmit inference after an archive failure.",
     "result": "Return central Artifact ContentRefs for a completed speech take. Download through artifact.read and explicitly archive in the same Project.",
+    "list": "List speech tasks for the caller (NSFW items are unconditionally excluded from MCP responses).",
+    "rate_content": "Record content rating (general or nsfw) for a speech task or output artifact version. Add-only; cannot clear an existing nsfw rating.",
 }
 TOOLS = [{"name": "speech." + k, "description": v,
           "inputSchema": {**CONTRACT["$defs"][k], "$defs": CONTRACT["$defs"]}}
          for k, v in DESCRIPTIONS.items()]
+SPEECH_TOOLS_SCHEMA = TOOLS
 
 
-def public(row):
+def public(row, *, filter_nsfw_outputs=None):
     state = row["state"]
     out = {k: row[k] for k in ("task_id", "project_id", "status", "phase")}
     out.update(
@@ -237,7 +251,17 @@ def public(row):
             "recovery_required": row["last_error"] in ("recovery_required", "model_version_changed", "unverified_voice_engine"),
         }
     if row["status"] == "succeeded":
-        out["outputs"] = state["outputs"]
+        outputs = state["outputs"]
+        if filter_nsfw_outputs is not None:
+            filtered_outputs = []
+            for entry in outputs:
+                cref = entry.get("content_ref") if isinstance(entry, dict) else None
+                vid = (cref or {}).get("version_id") or (cref or {}).get("artifact_id") or (entry.get("version_id") if isinstance(entry, dict) else None)
+                if vid and filter_nsfw_outputs.is_nsfw(vid):
+                    continue
+                filtered_outputs.append(entry)
+            outputs = filtered_outputs
+        out["outputs"] = outputs
         out["model_manifest_sha256"] = state["profile"]["model_manifest_sha256"]
     return out
 

@@ -5,7 +5,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .domain import Failure, canonical, digest, new_id, scope
+from .domain import Failure, TaskNotFound, canonical, digest, new_id, scope
 
 
 class Store:
@@ -46,7 +46,7 @@ class Store:
             row = c.execute("SELECT * FROM speech_tasks WHERE task_id=%s AND scope=%s",
                             (task_id, scope(p, project_id))).fetchone()
         if not row:
-            raise Failure("task_not_found", 404)
+            raise TaskNotFound("task_not_found", 404)
         return row
 
     def get_by_id(self, p, task_id):
@@ -56,8 +56,28 @@ class Store:
                 (task_id, p["organization_id"], p["subject_id"]),
             ).fetchone()
         if not row:
-            raise Failure("task_not_found", 404)
+            raise TaskNotFound("task_not_found", 404)
         return row
+
+    def find_by_version(self, version_id, project_id=None):
+        with self.connect() as c:
+            if project_id:
+                rows = c.execute(
+                    "SELECT * FROM speech_tasks WHERE project_id=%s ORDER BY created_at DESC LIMIT 500",
+                    (project_id,),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM speech_tasks ORDER BY created_at DESC LIMIT 500"
+                ).fetchall()
+        for r in rows:
+            if r["task_id"] == version_id or r.get("artifact_id") == version_id:
+                return r
+            for out in (r.get("state") or {}).get("outputs") or []:
+                cref = out.get("content_ref") if isinstance(out, dict) else None
+                if isinstance(cref, dict) and version_id in (cref.get("version_id"), cref.get("artifact_id")):
+                    return r
+        return None
 
     def list_for_principal(self, p, project_id=None):
         with self.connect() as c:

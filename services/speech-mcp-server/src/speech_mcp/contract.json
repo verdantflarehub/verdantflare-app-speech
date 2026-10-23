@@ -480,6 +480,9 @@
           "items": {
             "$ref": "#/$defs/engine_capability"
           }
+        },
+        "content_rating": {
+          "type": "object"
         }
       },
       "required": [
@@ -971,6 +974,15 @@
         "recovery_required": {
           "type": "boolean",
           "description": "true only for failed tasks whose upstream outcome is unknown; never auto-resubmitted"
+        },
+        "content_rating": {
+          "type": "object"
+        },
+        "can_clear_rating": {
+          "type": "boolean"
+        },
+        "can_mark_rating": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -1026,6 +1038,12 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 100
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/task_summary"
+          }
         }
       },
       "required": [
@@ -1374,6 +1392,87 @@
           "design"
         ]
       }
+    },
+    "list": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "rate_content": {
+      "type": "object",
+      "properties": {
+        "version_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "content_ref": {
+          "$ref": "#/$defs/content_ref"
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rating": {
+          "type": "string",
+          "enum": [
+            "general",
+            "nsfw"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "reasons": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "rubric_version": {
+          "type": "string",
+          "default": "rubric v1.0"
+        },
+        "evaluator_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "rating"
+      ],
+      "additionalProperties": false
     }
   }
 }

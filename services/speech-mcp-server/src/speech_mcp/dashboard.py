@@ -5,8 +5,9 @@ import contextlib
 
 from . import __version__
 from .domain import (
-     TOOLS,
+    TOOLS,
     Failure,
+    TaskNotFound,
     build_text_record,
     check_take_staleness,
     digest,
@@ -61,7 +62,7 @@ def _build_take_positions(rows):
     return positions
 
 
-def summarize_row(row, take_index=1, take_count=1):
+def summarize_row(row, take_index=1, take_count=1, ui_fields=None):
     req = row.get("request") or {}
     state = row.get("state") or {}
     profile = state.get("profile") or {}
@@ -113,6 +114,8 @@ def summarize_row(row, take_index=1, take_count=1):
         summary["warnings"] = []
     if last_error:
         summary["error_code"] = str(last_error)[:64]
+    if isinstance(ui_fields, dict):
+        summary.update(ui_fields)
     return validate("task_summary", summary)
 
 
@@ -122,11 +125,16 @@ class DashboardAPI:
         self.store = service.store
         self.peers = service.peers
 
-    async def overview(self, p):
+    async def overview(self, p, *, include_nsfw=False):
         rows = await asyncio.to_thread(self.store.list_for_principal, p)
+        rows = [r for r in rows if include_nsfw or not self.service.is_row_nsfw(r)]
         positions = _build_take_positions(rows)
         summaries = [
-            summarize_row(r, *positions.get(r["task_id"], (1, 1)))
+            summarize_row(
+                r,
+                *positions.get(r["task_id"], (1, 1)),
+                ui_fields=self.service.row_ui_fields(r, can_write=True),
+            )
             for r in rows
         ]
         rt = await self.service.engine_runtime_info(p)
@@ -153,12 +161,24 @@ class DashboardAPI:
             "recent_tasks": summaries[:500],
         }
 
-    async def query_tasks(self, p, query=None):
-        q_obj = validate("dashboard_task_query", query or {})
+    async def query_tasks(self, p, query=None, *, include_nsfw=False):
+        raw_q = dict(query or {})
+        limit_override = raw_q.pop("limit", None)
+        offset_override = raw_q.pop("offset", None)
+        if "page" in raw_q and isinstance(raw_q["page"], str) and raw_q["page"].isdigit():
+            raw_q["page"] = int(raw_q["page"])
+        if "page_size" in raw_q and isinstance(raw_q["page_size"], str) and raw_q["page_size"].isdigit():
+            raw_q["page_size"] = int(raw_q["page_size"])
+        q_obj = validate("dashboard_task_query", raw_q)
         rows = await asyncio.to_thread(self.store.list_for_principal, p, q_obj.get("project_id"))
+        rows = [r for r in rows if include_nsfw or not self.service.is_row_nsfw(r)]
         positions = _build_take_positions(rows)
         summaries = [
-            summarize_row(r, *positions.get(r["task_id"], (1, 1)))
+            summarize_row(
+                r,
+                *positions.get(r["task_id"], (1, 1)),
+                ui_fields=self.service.row_ui_fields(r, can_write=True),
+            )
             for r in rows
         ]
         filtered = []
@@ -192,15 +212,46 @@ class DashboardAPI:
             filtered.append(s)
         page = int(q_obj.get("page", 1))
         page_size = int(q_obj.get("page_size", 50))
-        start = (page - 1) * page_size
+        if limit_override is not None:
+            page_size = max(1, min(100, int(limit_override)))
+        start = int(offset_override) if offset_override is not None else (page - 1) * page_size
         end = start + page_size
+        page_items = filtered[start:end]
         result = {
-            "items": filtered[start:end],
+            "items": page_items,
+            "tasks": page_items,
             "total": len(filtered),
             "page": page,
             "page_size": page_size,
         }
         return validate("task_list_result", result)
+
+    async def task_stats(self, p, *, project_id=None, include_nsfw=False):
+        rows = await asyncio.to_thread(self.store.list_for_principal, p, project_id)
+        rows = [r for r in rows if include_nsfw or not self.service.is_row_nsfw(r)]
+        succeeded = [r for r in rows if r.get("status") == "succeeded"]
+        durations = [_elapsed_seconds(r) for r in succeeded]
+        avg_dur = round(sum(durations) / len(durations), 2) if durations else 0.0
+        total = len(rows)
+        pending_cnt = sum(1 for r in rows if r.get("status") == "pending")
+        running_cnt = sum(1 for r in rows if r.get("status") == "running")
+        failed_cnt = sum(1 for r in rows if r.get("status") == "failed")
+        canceled_cnt = sum(1 for r in rows if r.get("status") in ("cancelled", "canceled"))
+        return {
+            "total": total,
+            "total_tasks": total,
+            "queued": pending_cnt,
+            "pending": pending_cnt,
+            "running": running_cnt,
+            "running_tasks": pending_cnt + running_cnt,
+            "completed": len(succeeded),
+            "succeeded": len(succeeded),
+            "succeeded_tasks": len(succeeded),
+            "failed": failed_cnt,
+            "failed_tasks": failed_cnt,
+            "canceled": canceled_cnt,
+            "avg_duration": avg_dur,
+        }
 
     async def _ensure_report(self, p, row):
         state = row.get("state") or {}
@@ -220,14 +271,18 @@ class DashboardAPI:
                 return doc
         return None
 
-    async def task_detail(self, p, task_id):
+    async def task_detail(self, p, task_id, *, include_nsfw=False):
         validate("id", task_id)
         row = await asyncio.to_thread(self.store.get_by_id, p, task_id)
+        if not include_nsfw and self.service.is_row_nsfw(row):
+            raise TaskNotFound("task_not_found", 404)
         opened = await self.peers.open(p, row["project_id"], write=False)
+        can_write = bool(opened.get("can_write", True))
         req = row.get("request") or {}
         state = row.get("state") or {}
         utterance_id = req.get("utterance_id") or "U01"
         siblings = await asyncio.to_thread(self.store.utterance_takes, p, row["project_id"], utterance_id)
+        siblings = [s for s in siblings if include_nsfw or not self.service.is_row_nsfw(s)]
         if not siblings:
             siblings = [row]
         positions = _build_take_positions(siblings)
@@ -235,9 +290,17 @@ class DashboardAPI:
         takes = []
         for sib in siblings:
             idx, cnt = positions.get(sib["task_id"], (1, len(siblings)))
-            takes.append(summarize_row(sib, idx, cnt))
+            takes.append(
+                summarize_row(
+                    sib,
+                    idx,
+                    cnt,
+                    ui_fields=self.service.row_ui_fields(sib, can_write=can_write),
+                )
+            )
         cur_idx, cur_cnt = positions.get(row["task_id"], (1, len(siblings)))
-        summary = summarize_row(row, cur_idx, cur_cnt)
+        ui_fields = self.service.row_ui_fields(row, can_write=can_write)
+        summary = summarize_row(row, cur_idx, cur_cnt, ui_fields=ui_fields)
         voice_source = state.get("voice_source") or (
             {"kind": "world", "world_voice": req["world_voice"], "reference_sha256": state["profile"]["reference"]["sha256"]}
             if "world_voice" in req
@@ -279,10 +342,11 @@ class DashboardAPI:
             resolved_emotion = req["emotion_vector"]
         return {
             "summary": summary,
-            "task": public(row),
+            "task": public(row, filter_nsfw_outputs=None if include_nsfw else self.service.active_ratings()),
             "request": req,
             "head_revision_id": head_revision_id,
-            "can_write": bool(opened.get("can_write", True)),
+            "can_write": can_write,
+            **ui_fields,
             "voice_profile": state.get("profile"),
             "voice_source": voice_source,
             "text": text_info,
@@ -300,11 +364,13 @@ class DashboardAPI:
             "reviewed_revision_id": state.get("reviewed_revision_id"),
         }
 
-    async def task_audio(self, p, task_id, kind):
+    async def task_audio(self, p, task_id, kind, *, include_nsfw=False):
         validate("id", task_id)
         if kind not in ("original", "editing"):
             raise Failure("invalid_arguments", 400)
         row = await asyncio.to_thread(self.store.get_by_id, p, task_id)
+        if not include_nsfw and self.service.is_row_nsfw(row):
+            raise TaskNotFound("task_not_found", 404)
         await self.peers.open(p, row["project_id"], write=False)
         if row["status"] != "succeeded":
             raise Failure("result_not_ready", 409)
@@ -313,6 +379,10 @@ class DashboardAPI:
         entry = next((x for x in outputs if x.get("name") == filename), None)
         if not entry:
             raise Failure("result_not_ready", 409)
+        cref = entry.get("content_ref") if isinstance(entry, dict) else None
+        vid = (cref or {}).get("version_id") or (cref or {}).get("artifact_id")
+        if not include_nsfw and vid and self.service.active_ratings().is_nsfw(vid, task_id=task_id):
+            raise TaskNotFound("task_not_found", 404)
         if entry.get("content_ref"):
             data, _ = await self.peers.task_output_content(p, entry["content_ref"], row["project_id"], 16 << 20)
         else:
@@ -352,7 +422,7 @@ class DashboardAPI:
             body.get("note"),
             body["expected_revision_id"],
         )
-        return await self.task_detail(p, task_id)
+        return await self.task_detail(p, task_id, include_nsfw=True)
 
     async def models(self, p):
         rt = await self.service.engine_runtime_info(p)
