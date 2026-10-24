@@ -200,21 +200,66 @@ def applications(service, mcp_token, registry=None, start_worker=True):
     @mcp.get("/api/tasks/{task_id}")
     @mcp.get("/speech/api/tasks/{task_id}")
     async def api_task_detail(task_id: str, request: Request):
-        p = request_principal(request)
+        p = request_principal(request, allow_fallback=True)
         include_nsfw = include_nsfw_from_headers(request.headers)
         return await dash.task_detail(p, task_id, include_nsfw=include_nsfw)
+
+    @mcp.post("/api/tasks/{task_id}/title")
+    @mcp.post("/speech/api/tasks/{task_id}/title")
+    async def api_task_title(task_id: str, request: Request):
+        p = request_principal(request, allow_fallback=True)
+        body = await read(request)
+        if not isinstance(body, dict):
+            raise Failure("invalid_arguments", 400)
+        return await dash.rename_task(p, task_id, body.get("title"))
+
+    @mcp.post("/api/tasks/{task_id}/delete")
+    @mcp.post("/speech/api/tasks/{task_id}/delete")
+    @mcp.delete("/api/tasks/{task_id}")
+    @mcp.delete("/speech/api/tasks/{task_id}")
+    async def api_task_delete(task_id: str, request: Request):
+        p = request_principal(request, allow_fallback=True)
+        return await dash.delete_task(p, task_id)
+
+    @mcp.post("/api/tasks/{task_id}/content-rating")
+    @mcp.post("/speech/api/tasks/{task_id}/content-rating")
+    async def api_task_content_rating(task_id: str, request: Request):
+        p = request_principal(request, allow_fallback=True)
+        body = await read(request, allow_empty=True)
+        if not isinstance(body, dict):
+            raise Failure("invalid_arguments", 400)
+        action = body.get("action")
+        reason = body.get("reason") or body.get("note")
+        actor_id = (
+            request.headers.get("x-user-id", "").strip()
+            or str(body.get("actor_user_id") or body.get("user_id") or body.get("actor_id") or "").strip()
+            or ((p or {}).get("subject_id") or "").strip()
+        )
+        try:
+            return await dash.update_content_rating(
+                p,
+                task_id,
+                action,
+                reason=reason,
+                actor_user_id=actor_id,
+            )
+        except ContentRatingError as exc:
+            return JSONResponse(
+                {"code": exc.error_code, "error": exc.error_code, "error_code": exc.error_code, "message": exc.message},
+                status_code=exc.status_code,
+            )
 
     @mcp.get("/api/tasks/{task_id}/audio/{kind}")
     @mcp.get("/speech/api/tasks/{task_id}/audio/{kind}")
     async def api_task_audio(task_id: str, kind: str, request: Request):
-        p = request_principal(request)
+        p = request_principal(request, allow_fallback=True)
         include_nsfw = include_nsfw_from_headers(request.headers)
         return await dash.task_audio(p, task_id, kind, include_nsfw=include_nsfw)
 
     @mcp.post("/api/tasks/{task_id}/review")
     @mcp.post("/speech/api/tasks/{task_id}/review")
     async def api_task_review(task_id: str, request: Request):
-        p = request_principal(request)
+        p = request_principal(request, allow_fallback=True)
         body = await read(request)
         return await dash.write_review(p, task_id, body)
 

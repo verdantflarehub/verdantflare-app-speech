@@ -651,11 +651,104 @@ p {
   padding-top: 10px;
   border-top: 0.5px solid var(--line);
   display: flex;
-  justify-content: flex-start;
+  justify-content: space-between;
   align-items: center;
   gap: 8px;
   font-size: 11px;
   color: var(--muted);
+}
+
+.card-menu-wrap {
+  position: relative;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.card-more-btn {
+  padding: 2px 8px;
+  min-width: 28px;
+  height: 24px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1;
+  font-weight: var(--vf-weight-bold);
+  letter-spacing: 1px;
+  color: var(--muted);
+  background: var(--subtle);
+  border: 0.5px solid var(--line-strong);
+  box-shadow: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.card-more-btn:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--panel);
+  border-color: var(--accent);
+}
+
+.card-action-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 30;
+  min-width: 156px;
+  padding: 4px;
+  border-radius: 9px;
+  background: var(--panel);
+  border: 0.5px solid var(--line-strong);
+  box-shadow: var(--vf-shadow-card-hover), var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.card-action-item {
+  width: 100%;
+  text-align: left;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  font-size: 12px;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.card-action-item:hover:not(:disabled) {
+  background: var(--selected);
+  color: var(--accent);
+  box-shadow: none;
+}
+
+.card-action-item.danger {
+  color: var(--danger);
+}
+
+.card-action-item.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.table-action-cell {
+  width: 56px;
+  text-align: right;
+  overflow: visible;
+}
+
+.nsfw-badge,
+.tags span.nsfw-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: var(--vf-weight-bold);
+  color: var(--danger);
+  background: var(--danger-soft);
+  border: 0.5px solid rgba(201, 87, 67, 0.35);
 }
 
 .table-wrap {

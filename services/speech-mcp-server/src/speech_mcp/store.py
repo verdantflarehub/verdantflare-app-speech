@@ -177,3 +177,51 @@ class Store:
                            row["task_id"], row["lease_token"])).rowcount
         if n != 1:
             raise Failure("lease_lost", 409, True)
+
+    def rename_task(self, task_id: str, title: str, p=None):
+        if not isinstance(title, str):
+            raise Failure("invalid_arguments", 400)
+        clean_title = title.strip()
+        if not clean_title or len(clean_title) > 120:
+            raise Failure("invalid_arguments", 400)
+        with self.connect() as c:
+            if p and p.get("organization_id") and p.get("subject_id"):
+                row = c.execute(
+                    "SELECT * FROM speech_tasks WHERE task_id=%s AND organization_id=%s AND subject_id=%s FOR UPDATE",
+                    (task_id, p["organization_id"], p["subject_id"]),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT * FROM speech_tasks WHERE task_id=%s FOR UPDATE",
+                    (task_id,),
+                ).fetchone()
+            if not row:
+                raise TaskNotFound("task_not_found", 404)
+            state = dict(row.get("state") or {})
+            state["title"] = clean_title
+            updated = c.execute(
+                "UPDATE speech_tasks SET state=%s, updated_at=now() WHERE task_id=%s RETURNING *",
+                (Jsonb(state), task_id),
+            ).fetchone()
+        if updated is not None:
+            updated["title"] = clean_title
+        return updated
+
+    def delete_task(self, task_id: str, p=None):
+        with self.connect() as c:
+            if p and p.get("organization_id") and p.get("subject_id"):
+                deleted = c.execute(
+                    "DELETE FROM speech_tasks WHERE task_id=%s AND organization_id=%s AND subject_id=%s RETURNING task_id",
+                    (task_id, p["organization_id"], p["subject_id"]),
+                ).fetchone()
+            else:
+                deleted = c.execute(
+                    "DELETE FROM speech_tasks WHERE task_id=%s RETURNING task_id",
+                    (task_id,),
+                ).fetchone()
+        if not deleted:
+            raise TaskNotFound("task_not_found", 404)
+        return {"status": "deleted", "task_id": task_id}
+
+
+TaskStore = Store

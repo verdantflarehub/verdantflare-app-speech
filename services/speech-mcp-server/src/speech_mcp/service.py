@@ -233,6 +233,100 @@ class Service:
         )
         return res
 
+    def rename_task(self, task_id: str, title: str, *, p=None) -> dict:
+        if not isinstance(title, str):
+            raise Failure("invalid_arguments", 400)
+        clean_title = title.strip()
+        if not clean_title or len(clean_title) > 120:
+            raise Failure("invalid_arguments", 400)
+        if hasattr(self.store, "rename_task"):
+            try:
+                updated = self.store.rename_task(task_id, clean_title, p=p)
+            except TypeError:
+                updated = self.store.rename_task(task_id, clean_title)
+            return {
+                "status": "ok",
+                "task_id": task_id,
+                "title": clean_title,
+                "task": updated if isinstance(updated, dict) else None,
+            }
+        row = self.find_row_by_version(task_id, p=p)
+        if row is None:
+            raise TaskNotFound("task_not_found", 404)
+        row["title"] = clean_title
+        if isinstance(row.get("state"), dict):
+            row["state"]["title"] = clean_title
+        return {"status": "ok", "task_id": task_id, "title": clean_title}
+
+    def delete_task(self, task_id: str, *, p=None) -> dict:
+        if hasattr(self.store, "delete_task"):
+            try:
+                res = self.store.delete_task(task_id, p=p)
+            except TypeError:
+                res = self.store.delete_task(task_id)
+            if isinstance(res, dict) and res.get("status") == "deleted":
+                return res
+            return {"status": "deleted", "task_id": task_id}
+        if hasattr(self.store, "rows") and isinstance(self.store.rows, dict):
+            if task_id not in self.store.rows:
+                raise TaskNotFound("task_not_found", 404)
+            self.store.rows.pop(task_id, None)
+            if getattr(self.store, "prior", None) and self.store.prior.get("task_id") == task_id:
+                self.store.prior = None
+            return {"status": "deleted", "task_id": task_id}
+        raise TaskNotFound("task_not_found", 404)
+
+    def update_task_content_rating(
+        self,
+        task_id: str,
+        action: str,
+        *,
+        reason: str | None = None,
+        actor_user_id: str | None = None,
+        p=None,
+    ) -> dict:
+        clean_action = str(action or "").strip().lower()
+        if clean_action not in ("mark", "clear"):
+            raise Failure("invalid_arguments", 400)
+        row = self.find_row_by_version(task_id, p=p)
+        if row is None and p is not None:
+            row = self.find_row_by_version(task_id, p=None)
+        if row is None:
+            raise TaskNotFound("task_not_found", 404)
+        actor = (
+            (actor_user_id or "").strip()
+            or ((p or {}).get("subject_id") or "").strip()
+            or "studio-user"
+        )
+        primary_vid = self.primary_version_id(row) or task_id
+        if clean_action == "mark":
+            rec = self.mark_content_rating(
+                primary_vid,
+                actor_user_id=actor,
+                reason=reason or "manual mark from card menu",
+                project_id=row.get("project_id"),
+                p=p,
+            )
+            return {
+                **rec,
+                "status": "ok",
+                "task_id": row["task_id"],
+                "content_rating": "nsfw",
+            }
+        rec = self.clear_content_rating(
+            primary_vid,
+            actor_user_id=actor,
+            note=reason or "manual clear from card menu",
+            project_id=row.get("project_id"),
+            p=p,
+        )
+        return {
+            **rec,
+            "status": "ok",
+            "task_id": row["task_id"],
+            "content_rating": "general",
+        }
+
     async def engine_runtime_info(self, p):
         ready = False
         reason = "connect_failed"

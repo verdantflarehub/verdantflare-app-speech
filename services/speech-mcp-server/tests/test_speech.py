@@ -10,6 +10,7 @@ from speech_mcp.clients import Client, Peers
 from speech_mcp.domain import (
     Failure,
     IndexTTS2Adapter,
+    TaskNotFound,
     apply_lexicon,
     build_text_record,
     canonical,
@@ -140,6 +141,39 @@ class MemoryStore:
         self.row = copy.deepcopy(row)
         self.rows[self.row["task_id"]] = self.row
     def renew(self, row): pass
+    def rename_task(self, task_id: str, title: str, p=None):
+        if not isinstance(title, str):
+            raise Failure("invalid_arguments", 400)
+        clean_title = title.strip()
+        if not clean_title or len(clean_title) > 120:
+            raise Failure("invalid_arguments", 400)
+        r = self.rows.get(task_id)
+        if not r or (
+            p
+            and (
+                p.get("organization_id") != r["principal"]["organization_id"]
+                or p.get("subject_id") != r["principal"]["subject_id"]
+            )
+        ):
+            raise TaskNotFound("task_not_found", 404)
+        r["title"] = clean_title
+        r["state"]["title"] = clean_title
+        r["updated_at"] = datetime.now(timezone.utc)
+        return copy.deepcopy(r)
+    def delete_task(self, task_id: str, p=None):
+        r = self.rows.get(task_id)
+        if not r or (
+            p
+            and (
+                p.get("organization_id") != r["principal"]["organization_id"]
+                or p.get("subject_id") != r["principal"]["subject_id"]
+            )
+        ):
+            raise TaskNotFound("task_not_found", 404)
+        self.rows.pop(task_id, None)
+        if self.prior and self.prior.get("task_id") == task_id:
+            self.prior = None
+        return {"status": "deleted", "task_id": task_id}
 
 
 class ContractTests(unittest.TestCase):

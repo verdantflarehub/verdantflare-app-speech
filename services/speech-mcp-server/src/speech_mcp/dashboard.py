@@ -96,6 +96,13 @@ def summarize_row(row, take_index=1, take_count=1, ui_fields=None):
     label = profile.get("label") or profile.get("voice_id")
     if label:
         summary["voice_label"] = str(label)[:128]
+    custom_title = row.get("title") or state.get("title") or req.get("title")
+    default_title = f"{character or label or '角色'} · {summary['utterance_id']}"
+    summary["title"] = (
+        str(custom_title).strip()[:120]
+        if isinstance(custom_title, str) and custom_title.strip()
+        else default_title[:120]
+    )
     editing_metrics = report.get("editing") if isinstance(report, dict) else None
     if isinstance(editing_metrics, dict) and (editing_metrics.get("duration_seconds") or 0) > 0:
         summary["duration_seconds"] = float(editing_metrics["duration_seconds"])
@@ -116,6 +123,8 @@ def summarize_row(row, take_index=1, take_count=1, ui_fields=None):
         summary["error_code"] = str(last_error)[:64]
     if isinstance(ui_fields, dict):
         summary.update(ui_fields)
+    if "content_rating" not in summary:
+        summary["content_rating"] = "unrated"
     return validate("task_summary", summary)
 
 
@@ -203,6 +212,7 @@ class DashboardAPI:
                 haystack = " ".join([
                     s["task_id"],
                     s["utterance_id"],
+                    s.get("title", ""),
                     s.get("character", ""),
                     s.get("voice_label", ""),
                     s["text"],
@@ -341,6 +351,8 @@ class DashboardAPI:
         if resolved_emotion is None and "emotion_vector" in req:
             resolved_emotion = req["emotion_vector"]
         return {
+            "task_id": row["task_id"],
+            "title": summary["title"],
             "summary": summary,
             "task": public(row, filter_nsfw_outputs=None if include_nsfw else self.service.active_ratings()),
             "request": req,
@@ -363,6 +375,25 @@ class DashboardAPI:
             "review_note": state.get("review_note", ""),
             "reviewed_revision_id": state.get("reviewed_revision_id"),
         }
+
+    list_tasks = query_tasks
+    get_task_detail = task_detail
+
+    async def rename_task(self, p, task_id, title):
+        return await asyncio.to_thread(self.service.rename_task, task_id, title, p=p)
+
+    async def delete_task(self, p, task_id):
+        return await asyncio.to_thread(self.service.delete_task, task_id, p=p)
+
+    async def update_content_rating(self, p, task_id, action, *, reason=None, actor_user_id=None):
+        return await asyncio.to_thread(
+            self.service.update_task_content_rating,
+            task_id,
+            action,
+            reason=reason,
+            actor_user_id=actor_user_id,
+            p=p,
+        )
 
     async def task_audio(self, p, task_id, kind, *, include_nsfw=False):
         validate("id", task_id)

@@ -190,7 +190,8 @@ class ContentRatingStore:
         rec = self.get(version_id, task_id=task_id)
         rating = rec.get("rating", "unrated")
         return {
-            "content_rating": {
+            "content_rating": rating,
+            "content_rating_detail": {
                 "rating": rating,
                 "source": rec.get("source"),
                 "rubric_version": rec.get("rubric_version"),

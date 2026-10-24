@@ -975,7 +975,26 @@
           "type": "boolean",
           "description": "true only for failed tasks whose upstream outcome is unknown; never auto-resubmitted"
         },
+        "title": {
+          "type": "string",
+          "maxLength": 128
+        },
         "content_rating": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "general",
+                "nsfw",
+                "unrated"
+              ]
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "content_rating_detail": {
           "type": "object"
         },
         "can_clear_rating": {

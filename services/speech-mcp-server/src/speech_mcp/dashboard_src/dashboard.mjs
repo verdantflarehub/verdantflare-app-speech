@@ -77,6 +77,7 @@ const state = {
   pollTimer: null,
   reviewSubmitting: false,
   reviewFeedbackMessage: "",
+  openMenuTaskId: null,
 };
 
 function canonicalPath(raw) {
@@ -225,6 +226,24 @@ function updateFilterOptions() {
     characters.map((c) => `<option value="${esc(c)}" ${c === curChar ? "selected" : ""}>${esc(c)}</option>`).join("");
 }
 
+function isTaskNsfw(t) {
+  return t?.content_rating === "nsfw" || t?.content_rating?.rating === "nsfw";
+}
+
+function renderActionMenu(t) {
+  const isNsfw = isTaskNsfw(t);
+  const nsfwLabel = isNsfw ? "移除 18+ 标记" : "标记为 18+ (NSFW)";
+  const isOpen = state.openMenuTaskId === t.task_id;
+  return `<div class="card-menu-wrap">
+    <button type="button" class="card-more-btn" data-menu-toggle="${esc(t.task_id)}" aria-label="更多操作" aria-haspopup="menu" aria-expanded="${isOpen ? "true" : "false"}">···</button>
+    <div class="card-action-menu" role="menu" data-menu-for="${esc(t.task_id)}" ${isOpen ? "" : "hidden"}>
+      <button type="button" class="card-action-item" role="menuitem" data-task-action="edit" data-task-id="${esc(t.task_id)}">编辑</button>
+      <button type="button" class="card-action-item" role="menuitem" data-task-action="toggle-nsfw" data-task-id="${esc(t.task_id)}">${nsfwLabel}</button>
+      <button type="button" class="card-action-item danger" role="menuitem" data-task-action="delete" data-task-id="${esc(t.task_id)}">删除</button>
+    </div>
+  </div>`;
+}
+
 function filterTaskList() {
   const q = state.searchQuery.trim().toLowerCase();
   const base = state.tasks.filter((t) => {
@@ -232,7 +251,7 @@ function filterTaskList() {
     if (state.characterFilter !== "all" && (t.character || "") !== state.characterFilter) return false;
     if (state.reviewFilter !== "all" && t.review !== state.reviewFilter) return false;
     if (q) {
-      const hay = `${t.task_id} ${t.utterance_id} ${t.character || ""} ${t.voice_label || ""} ${t.text}`.toLowerCase();
+      const hay = `${t.task_id} ${t.utterance_id} ${t.title || ""} ${t.character || ""} ${t.voice_label || ""} ${t.text}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -270,6 +289,8 @@ function renderTasks() {
       const st = statusDisplay(t);
       const rv = reviewDisplay(t.review);
       const role = t.character || t.voice_label || "角色";
+      const displayTitle = t.title || `${role} · ${t.utterance_id}`;
+      const isNsfw = isTaskNsfw(t);
       const vLabel =
         t.voice_source === "world"
           ? `${t.voice_label || role}@world`
@@ -285,7 +306,7 @@ function renderTasks() {
           : t.shot_window_seconds
           ? `窗口 ${t.shot_window_seconds.toFixed(1)}s`
           : "时长待定";
-      return `<article class="card roving-item" data-task="${esc(t.task_id)}" role="button" tabindex="${idx === 0 ? "0" : "-1"}" aria-label="${esc(role + " " + t.utterance_id)}">
+      return `<article class="card roving-item" data-task="${esc(t.task_id)}" role="button" tabindex="${idx === 0 ? "0" : "-1"}" aria-label="${esc(displayTitle)}">
         <div class="thumb">
           <div class="music-thumb-wave" aria-hidden="true">${bars}</div>
           <div class="service" title="模型 × 渠道">IndexTTS2 × ${LOCAL_LOGO}本地</div>
@@ -294,7 +315,7 @@ function renderTasks() {
           <div class="image-times"><span>${esc(fmtDateTime(t.created_at))}</span><span>耗时 ${fmtSec(t.elapsed_seconds)}</span></div>
         </div>
         <div class="body">
-          <h2 class="task-title" title="${esc(role + " · " + t.utterance_id)}">${esc(role)} · ${esc(t.utterance_id)}</h2>
+          <h2 class="task-title" title="${esc(displayTitle)}">${esc(displayTitle)}</h2>
           <p class="prompt">${
             t.status === "succeeded"
               ? `声线 ${esc(vLabel)} · take ${t.take_index}/${t.take_count}`
@@ -302,10 +323,12 @@ function renderTasks() {
           }</p>
           <div class="foot">
             <div class="tags">
+              ${isNsfw ? `<span class="nsfw-badge">18+</span>` : ""}
               <span title="实际时长 / 镜头窗口" class="num">${esc(durText)}</span>
               ${warningBadges(t)}
               ${t.status === "succeeded" ? `<span class="${rv.cls}">${esc(rv.label)}</span>` : ""}
             </div>
+            ${renderActionMenu(t)}
           </div>
         </div>
       </article>`;
@@ -313,12 +336,14 @@ function renderTasks() {
     .join("");
 
   $("#table").innerHTML =
-    "<table><thead><tr><th>角色 · utterance</th><th>台词</th><th>声线</th><th>时长 / 窗口</th><th>质检</th><th>听审</th><th>状态</th></tr></thead><tbody>" +
+    "<table><thead><tr><th>角色 · utterance</th><th>台词</th><th>声线</th><th>时长 / 窗口</th><th>质检</th><th>听审</th><th>状态</th><th>操作</th></tr></thead><tbody>" +
     rows
       .map((t) => {
         const st = statusDisplay(t);
         const rv = reviewDisplay(t.review);
         const role = t.character || t.voice_label || "角色";
+        const displayTitle = t.title || `${role} · ${t.utterance_id}`;
+        const isNsfw = isTaskNsfw(t);
         const vLabel =
           t.voice_source === "world"
             ? `${t.voice_label || role}@world`
@@ -329,14 +354,15 @@ function renderTasks() {
             : t.duration_seconds
             ? `${t.duration_seconds.toFixed(1)}s`
             : "—";
-        return `<tr data-task="${esc(t.task_id)}" tabindex="0" role="button" aria-label="${esc(role + " " + t.utterance_id)}">
-          <td><strong>${esc(role)}</strong><br><small class="num" style="color:var(--muted)">${esc(t.utterance_id)}</small></td>
+        return `<tr data-task="${esc(t.task_id)}" tabindex="0" role="button" aria-label="${esc(displayTitle)}">
+          <td><strong>${esc(displayTitle)}</strong>${isNsfw ? ` <span class="nsfw-badge">18+</span>` : ""}<br><small class="num" style="color:var(--muted)">${esc(t.utterance_id)}</small></td>
           <td title="${esc(t.text)}">${esc(t.text)}</td>
           <td>${esc(vLabel)}<br><small style="color:var(--muted)">take ${t.take_index}/${t.take_count}</small></td>
           <td class="num">${esc(durText)}</td>
           <td><div class="tags">${warningBadges(t) || "<span>—</span>"}</div></td>
           <td><div class="tags">${t.status === "succeeded" ? `<span class="${rv.cls}">${esc(rv.label)}</span>` : "<span>—</span>"}</div></td>
           <td><span class="status ${st.cls}" style="position:static">${esc(st.label)}</span></td>
+          <td class="table-action-cell">${renderActionMenu(t)}</td>
         </tr>`;
       })
       .join("") +
@@ -629,12 +655,13 @@ function renderTaskDetail() {
     : `${st.label} · ${s.phase}`;
 
   const cachedAudio = state.detailAudioCache[`${s.task_id}:${state.currentAudioKind}`] || "";
+  const detailTitle = s.title || d.title || `${role} · ${s.utterance_id}`;
 
   $("#taskDetailSection").innerHTML = `<div class="detail-shell">
     <div class="inspect-head">
       <div>
         <span class="identity-channel" style="font-size:12px;color:var(--accent);font-weight:600">IndexTTS2 × ${LOCAL_LOGO}本地 · 项目 ${esc(s.project_id.slice(0, 8))}</span>
-        <h2 style="font-size:20px;margin-top:4px">${esc(role)} · ${esc(s.utterance_id)}</h2>
+        <h2 style="font-size:20px;margin-top:4px">${esc(detailTitle)}</h2>
         <small class="num" style="color:var(--muted);display:block;margin-top:4px">状态：${esc(st.label)} · 阶段 ${esc(s.phase)} · 排队 ${Number(timings.queue_seconds || 0).toFixed(1)}s / 加载 ${Number(timings.load_seconds || 0).toFixed(1)}s / 推理 ${Number(timings.inference_seconds || 0).toFixed(1)}s</small>
       </div>
       <div class="inspect-head-actions"><span class="quota-badge">${esc(st.label)}</span></div>
@@ -950,7 +977,7 @@ function applyRoute(rawPath, pushToHost = false) {
     $("#appTabs").hidden = true;
     $("#taskDetailSection").hidden = false;
     const matched = state.tasks.find((x) => x.task_id === subId);
-    const titleLabel = matched ? `${matched.character || "角色"} · ${matched.utterance_id}` : subId.slice(0, 8);
+    const titleLabel = matched ? matched.title || `${matched.character || "角色"} · ${matched.utterance_id}` : subId.slice(0, 8);
     $("#crumbCurrent").innerHTML = `<a href="/tasks" data-route="/tasks">任务</a> <span aria-hidden="true">/</span> <span aria-current="page">${esc(titleLabel)}</span>`;
     void openDetail(subId);
     if (state.host) state.host.restoreScroll(0);
@@ -981,8 +1008,67 @@ function applyRoute(rawPath, pushToHost = false) {
   notifyResize();
 }
 
+async function handleTaskAction(action, taskId) {
+  const t = state.tasks.find((x) => x.task_id === taskId);
+  if (!t) return;
+  if (action === "edit") {
+    const role = t.character || t.voice_label || "角色";
+    const currentTitle = t.title || `${role} · ${t.utterance_id}`;
+    const nextTitle = typeof window.prompt === "function" ? window.prompt("编辑任务标题", currentTitle) : null;
+    if (nextTitle === null) return;
+    const title = nextTitle.trim();
+    if (!title) return;
+    await apiRequest("POST", "/api/tasks/" + encodeURIComponent(taskId) + "/title", { title });
+    await refreshAll();
+    return;
+  }
+  if (action === "toggle-nsfw") {
+    const isNsfw = isTaskNsfw(t);
+    const ratingAction = isNsfw ? "clear" : "mark";
+    const reason = ratingAction === "clear" ? "manual clear from card menu" : "manual mark from card menu";
+    await apiRequest("POST", "/api/tasks/" + encodeURIComponent(taskId) + "/content-rating", {
+      action: ratingAction,
+      reason,
+    });
+    await refreshAll();
+    return;
+  }
+  if (action === "delete") {
+    const confirmed = typeof window.confirm === "function" ? window.confirm("确认删除该任务？") : true;
+    if (!confirmed) return;
+    await apiRequest("POST", "/api/tasks/" + encodeURIComponent(taskId) + "/delete", {});
+    await refreshAll();
+  }
+}
+
 function bindEvents() {
   document.addEventListener("click", (e) => {
+    const actionBtn = e.target.closest("[data-task-action]");
+    if (actionBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const action = actionBtn.dataset.taskAction;
+      const taskId = actionBtn.dataset.taskId || actionBtn.closest("[data-task]")?.dataset.task;
+      state.openMenuTaskId = null;
+      renderTasks();
+      if (taskId) {
+        void handleTaskAction(action, taskId);
+      }
+      return;
+    }
+    const menuToggle = e.target.closest("[data-menu-toggle]");
+    if (menuToggle) {
+      e.preventDefault();
+      e.stopPropagation();
+      const tid = menuToggle.dataset.menuToggle;
+      state.openMenuTaskId = state.openMenuTaskId === tid ? null : tid;
+      renderTasks();
+      return;
+    }
+    if (state.openMenuTaskId && !e.target.closest(".card-action-menu")) {
+      state.openMenuTaskId = null;
+      renderTasks();
+    }
     const routeLink = e.target.closest("[data-route]");
     if (routeLink) {
       e.preventDefault();

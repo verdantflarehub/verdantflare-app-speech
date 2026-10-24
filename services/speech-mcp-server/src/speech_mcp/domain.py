@@ -238,6 +238,8 @@ def public(row, *, filter_nsfw_outputs=None):
     )
     if state.get("review") in ("pending", "approved", "rejected"):
         out["review"] = state["review"]
+    if row.get("title") or state.get("title"):
+        out["title"] = row.get("title") or state.get("title")
     if state.get("review_note"):
         out["review_note"] = state["review_note"]
     if state.get("timings"):

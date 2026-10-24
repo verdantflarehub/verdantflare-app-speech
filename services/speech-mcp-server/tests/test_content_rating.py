@@ -365,7 +365,8 @@ class TestSpeechMcpAndHttpContentRating(unittest.IsolatedAsyncioTestCase):
             inc_data = resp_inc.json()
             self.assertEqual(inc_data["total"], 2)
             nsfw_item = next(t for t in inc_data["tasks"] if t["task_id"] == self.row_nsfw["task_id"])
-            self.assertEqual(nsfw_item["content_rating"]["rating"], "nsfw")
+            self.assertEqual(nsfw_item["content_rating"], "nsfw")
+            self.assertEqual(nsfw_item["content_rating_detail"]["rating"], "nsfw")
             self.assertTrue(nsfw_item["can_clear_rating"])
             self.assertFalse(nsfw_item["can_mark_rating"])
 
@@ -449,6 +450,100 @@ class TestSpeechMcpAndHttpContentRating(unittest.IsolatedAsyncioTestCase):
 
             marked_list = await self.svc.call("speech.list", {"project_id": self.project_id}, self.p)
             self.assertEqual(marked_list["total"], 1)
+
+    async def test_dashboard_card_actions_title_rating_and_delete(self) -> None:
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "X-Organization-Id": self.p["organization_id"],
+            "X-User-Id": self.p["subject_id"],
+            "X-Request-Id": self.p["request_id"],
+        }
+        tid = self.row_gen["task_id"]
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app),
+            base_url="https://test",
+        ) as client:
+            # 1. Verify dashboard assets include the 3-dot card action menu and NSFW badge
+            mjs_resp = await client.get("/internal/dashboard/assets/dashboard.mjs", headers=headers)
+            self.assertEqual(mjs_resp.status_code, 200)
+            mjs_text = mjs_resp.text
+            self.assertIn("card-more-btn", mjs_text)
+            self.assertIn("card-action-menu", mjs_text)
+            self.assertIn('data-task-action="edit"', mjs_text)
+            self.assertIn('data-task-action="toggle-nsfw"', mjs_text)
+            self.assertIn('data-task-action="delete"', mjs_text)
+            self.assertIn("nsfw-badge", mjs_text)
+
+            # 2. Rename task via POST /api/tasks/{task_id}/title
+            rename_resp = await client.post(
+                f"/api/tasks/{tid}/title",
+                headers=headers,
+                json={"title": "  谢小娥 · 东市重逢  "},
+            )
+            self.assertEqual(rename_resp.status_code, 200)
+            self.assertEqual(rename_resp.json()["title"], "谢小娥 · 东市重逢")
+
+            # Empty title rejected with 400
+            bad_title = await client.post(
+                f"/speech/api/tasks/{tid}/title",
+                headers=headers,
+                json={"title": "   "},
+            )
+            self.assertEqual(bad_title.status_code, 400)
+
+            # Verify updated title appears in overview, tasks list, and detail
+            ov = (await client.get("/api/overview", headers=headers)).json()
+            item_ov = next(t for t in ov["recent_tasks"] if t["task_id"] == tid)
+            self.assertEqual(item_ov["title"], "谢小娥 · 东市重逢")
+
+            detail = (await client.get(f"/api/tasks/{tid}", headers=headers)).json()
+            self.assertEqual(detail["title"], "谢小娥 · 东市重逢")
+            self.assertEqual(detail["summary"]["title"], "谢小娥 · 东市重逢")
+
+            # 3. Mark NSFW via POST /api/tasks/{task_id}/content-rating
+            mark_resp = await client.post(
+                f"/api/tasks/{tid}/content-rating",
+                headers=headers,
+                json={"action": "mark", "reason": "manual mark from card menu"},
+            )
+            self.assertEqual(mark_resp.status_code, 200)
+            self.assertEqual(mark_resp.json()["content_rating"], "nsfw")
+
+            # Hidden by default, visible with X-VF-Include-NSFW: 1
+            tasks_hidden = (await client.get("/api/tasks", headers=headers)).json()
+            self.assertNotIn(tid, [t["task_id"] for t in tasks_hidden["items"]])
+
+            tasks_shown = (
+                await client.get("/api/tasks", headers={**headers, "X-VF-Include-NSFW": "1"})
+            ).json()
+            shown_item = next(t for t in tasks_shown["items"] if t["task_id"] == tid)
+            self.assertEqual(shown_item["content_rating"], "nsfw")
+
+            # Clear NSFW via POST /speech/api/tasks/{task_id}/content-rating
+            clear_resp = await client.post(
+                f"/speech/api/tasks/{tid}/content-rating",
+                headers=headers,
+                json={"action": "clear", "reason": "manual clear from card menu"},
+            )
+            self.assertEqual(clear_resp.status_code, 200)
+            self.assertEqual(clear_resp.json()["content_rating"], "general")
+            self.assertTrue(clear_resp.json()["human_cleared"])
+
+            # 4. Delete task via POST /api/tasks/{task_id}/delete and DELETE /speech/api/tasks/{task_id}
+            del_resp = await client.post(f"/api/tasks/{tid}/delete", headers=headers, json={})
+            self.assertEqual(del_resp.status_code, 200)
+            self.assertEqual(del_resp.json(), {"status": "deleted", "task_id": tid})
+
+            # Deleting again returns 404
+            del_again = await client.delete(f"/speech/api/tasks/{tid}", headers=headers)
+            self.assertEqual(del_again.status_code, 404)
+
+            # Delete second task via DELETE /api/tasks/{task_id}
+            tid2 = self.row_nsfw["task_id"]
+            del2 = await client.delete(f"/api/tasks/{tid2}", headers=headers)
+            self.assertEqual(del2.status_code, 200)
+            self.assertEqual(del2.json(), {"status": "deleted", "task_id": tid2})
 
 
 if __name__ == "__main__":
