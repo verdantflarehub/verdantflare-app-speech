@@ -379,28 +379,36 @@ function renderTasks() {
 }
 
 function renderModelsAndMcp() {
-  const engines = state.modelsData?.engines || state.overview?.engines || [];
+  const rawEngines = state.modelsData?.engines || state.overview?.engines || [];
   const rt = state.modelsData?.runtime || state.overview?.engine || {};
-  const primary = engines[0] || {
-    engine: "indextts2",
-    ready: false,
-    model_manifest_sha256: "0".repeat(64),
-    max_text_chars: 300,
-    reference_audio: { min_seconds: 3, max_seconds: 15, max_bytes: 10485760 },
-    emotion_inputs: ["emotion_vector", "emotion_text", "emotion_reference"],
-    unsupported: ["exact_duration", "speed", "cancel", "non_verbal", "streaming"],
-  };
-  const badgeText = primary.ready
-    ? "在线 · 已就绪"
-    : rt.wake_on_task
-    ? "按需唤醒 · 缩容待命"
-    : "离线 · 待唤醒";
+  const engineList = rawEngines.length
+    ? rawEngines
+    : [
+        {
+          engine: "indextts2",
+          ready: false,
+          model_manifest_sha256: "0".repeat(64),
+          max_text_chars: 300,
+          reference_audio: { min_seconds: 3, max_seconds: 15, max_bytes: 10485760 },
+          emotion_inputs: ["emotion_vector", "emotion_text", "emotion_reference"],
+          unsupported: ["exact_duration", "speed", "cancel", "non_verbal", "streaming"],
+        },
+      ];
+  const primary = engineList[0];
 
-  const catalogCards = [
-    {
-      id: "indextts2",
-      mark: "IX",
-      title: "IndexTTS2",
+  const catalogCards = engineList.map((eng) => {
+    const isReady = Boolean(eng.ready);
+    const badgeText = isReady
+      ? "在线 · 已就绪"
+      : rt.wake_on_task
+      ? "按需唤醒 · 缩容待命"
+      : "离线 · 待唤醒";
+    const engineId = eng.engine || "indextts2";
+    const title = engineId === "indextts2" ? "IndexTTS2" : engineId;
+    return {
+      id: engineId,
+      mark: engineId === "indextts2" ? "IX" : String(engineId).slice(0, 2).toUpperCase(),
+      title,
       badge: badgeText,
       caps: [
         ["CLONE", "参考声线克隆"],
@@ -409,27 +417,12 @@ function renderModelsAndMcp() {
         ["EMO-A", "情感参考音频"],
         ["ZH", "zh-CN"],
       ],
-      quota: `参考音频 1 段 · ${primary.reference_audio?.min_seconds || 3}–${primary.reference_audio?.max_seconds || 15}s · 单声道 16–48kHz｜台词 1–${primary.max_text_chars || 300} 字`,
+      quota: `参考音频 1 段 · ${eng.reference_audio?.min_seconds || 3}–${eng.reference_audio?.max_seconds || 15}s · 单声道 16–48kHz｜台词 1–${eng.max_text_chars || 300} 字`,
       unsupported: "精确时长、语速、取消、非语言音（喘息 / 哭声 / 笑声）、流式输出",
-      desc: `固定源码与全部权重 SHA-256（${String(primary.model_manifest_sha256).slice(0, 12)}…），离线加载；需空闲显存 ≥18GiB，经 GPU Lease 排队。`,
-      foot: ["22.05kHz 原生", "48kHz/24bit 剪辑副本", "WAV"],
-    },
-    {
-      id: "whisper-small",
-      mark: "QC",
-      title: "Faster-Whisper Small (ASR 复核)",
-      badge: "内置 · 同容器复核",
-      caps: [
-        ["CER", "字错率测量"],
-        ["DIFF", "逐字差异定位"],
-        ["LEX", "发音词典预期文本对齐"],
-      ],
-      quota: "每条生成结果识别一次，与剧本预期原文对齐计算 CER",
-      unsupported: "只测量并产生 transcript_mismatch 告警，不自动改写台词或重生成",
-      desc: "固定模型快照 whisper-small@9ecf779972d9（CPU int8 离线加载），写入 report.json 的 transcript_check。",
-      foot: ["report.json", "transcript_check"],
-    },
-  ];
+      desc: `固定源码与全部权重 SHA-256（${String(eng.model_manifest_sha256 || "0".repeat(64)).slice(0, 12)}…），离线加载；需空闲显存 ≥18GiB，经 GPU Lease 排队。内置 Faster-Whisper Small 后置 ASR 复核（写入 report.json 的 transcript_check）。`,
+      foot: ["22.05kHz 原生", "48kHz/24bit 剪辑副本", "report.json (transcript_check)", "WAV"],
+    };
+  });
 
   const countPill = $("#modelsCountPill");
   if (countPill) countPill.textContent = `本地 5090 · ${catalogCards.length} 项`;
@@ -486,29 +479,63 @@ function renderModelsAndMcp() {
       : "IndexTTS2 runtime · 按需唤醒 · GPU Lease 排队";
   }
 
+  const DEFAULT_TOOLS = [
+    { name: "speech.capabilities", description: "按引擎能力声明与限制" },
+    { name: "speech.voices", description: "项目已引用的 World 声线与候选" },
+    { name: "speech.create", description: "提交单句配音任务" },
+    { name: "speech.status", description: "任务状态、阶段与分离计时" },
+    { name: "speech.result", description: "四个 Artifact ContentRef" },
+    { name: "speech.list", description: "列出调用方配音任务（自动排除 NSFW）" },
+    { name: "speech.rate_content", description: "记录任务或产物内容分级（只增不减）" },
+  ];
+  const TOOL_LABELS = {
+    "speech.capabilities": "按引擎能力声明与限制",
+    "speech.voices": "项目已引用的 World 声线与候选",
+    "speech.create": "提交单句配音任务",
+    "speech.status": "任务状态、阶段与分离计时",
+    "speech.result": "四个 Artifact ContentRef",
+    "speech.list": "列出调用方配音任务（自动排除 NSFW）",
+    "speech.rate_content": "记录任务或产物内容分级（只增不减）",
+  };
+  const rawTools = state.mcpData?.tools || state.overview?.tools || [];
+  const toolItems = (rawTools.length ? rawTools : DEFAULT_TOOLS).map((t) => {
+    const name = typeof t === "string" ? t : t.name;
+    const label = TOOL_LABELS[name] || (typeof t === "object" && t.description) || name;
+    return [name, label];
+  });
+  const byGroup = { discovery: [], generation: [], lifecycle: [] };
+  for (const [name, label] of toolItems) {
+    if (name === "speech.capabilities" || name === "speech.voices") {
+      byGroup.discovery.push([name, label]);
+    } else if (name === "speech.create") {
+      byGroup.generation.push([name, label]);
+    } else {
+      byGroup.lifecycle.push([name, label]);
+    }
+  }
+
   const capGroups = [
     {
-      title: "1. 能力与声线发现（2 项）",
+      title: `1. 能力与声线发现（${byGroup.discovery.length} 项）`,
       desc: "读取按引擎能力声明与模型摘要；列出项目修订引用的 World 参考声线与项目内选角候选 profile。",
-      tools: [
-        ["speech.capabilities", "按引擎能力声明与限制"],
-        ["speech.voices", "项目已引用的 World 声线与候选"],
-      ],
+      tools: byGroup.discovery,
     },
     {
-      title: "2. 逐句生成（1 项）",
+      title: `2. 逐句生成（${byGroup.generation.length} 项）`,
       desc: "一句一个任务；支持 World 参考声线或候选 profile、三种互斥情感输入、发音词典与镜头窗口比较。",
-      tools: [["speech.create", "提交单句配音任务"]],
+      tools: byGroup.generation,
     },
     {
-      title: "3. 任务恢复与结果回读（2 项）",
-      desc: "按业务 task_id 查询阶段（含 loading_model 分离计时）与恢复状态；成功后返回 4 个中央 Artifact ContentRef。",
-      tools: [
-        ["speech.status", "任务状态、阶段与分离计时"],
-        ["speech.result", "四个 Artifact ContentRef"],
-      ],
+      title: `3. 任务恢复、查询与内容分级（${byGroup.lifecycle.length} 项）`,
+      desc: "按业务 task_id 查询阶段（含 loading_model 分离计时）与恢复状态；成功后返回 4 个中央 Artifact ContentRef，并支持任务列表与只增不减的内容分级。",
+      tools: byGroup.lifecycle,
     },
   ];
+  const totalTools = capGroups.reduce((acc, g) => acc + g.tools.length, 0);
+  const mcpCountPill = $("#mcpToolsCountPill");
+  if (mcpCountPill) {
+    mcpCountPill.textContent = `${capGroups.length} 组 ${totalTools} 项工具`;
+  }
   $("#mcpCapabilityCards").innerHTML = capGroups
     .map(
       (c) => `<article class="resource-card">

@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import inspect
+import logging
 import secrets
 from contextlib import asynccontextmanager
 
@@ -289,13 +290,27 @@ def applications(service, mcp_token, registry=None, start_worker=True):
             if artifact_id in (entry.get("version_id"), entry.get("artifact_id")):
                 matched_entry = entry
                 break
-        if matched_entry and matched_entry.get("content_ref") and getattr(service.peers, "task_output_content", None):
-            with contextlib.suppress( Exception ):
-                eff_p = p or row.get("principal")
-                res = await service.peers.task_output_content(eff_p, matched_entry["content_ref"], row["project_id"], 16 << 20)
-                if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], (bytes, bytearray)):
-                    return Response(content=bytes(res[0]), media_type=matched_entry.get("mime", "audio/wav"))
-        return Response(content=b"RIFF\x24\x00\x00\x00WAVEfmt ", media_type="audio/wav")
+        if not matched_entry or not matched_entry.get("content_ref"):
+            return JSONResponse({"code": "NOT_FOUND", "error": "artifact_not_found"}, status_code=404)
+        reader = getattr(service.peers, "task_output_content", None)
+        if not reader:
+            logging.getLogger(__name__).error("task_output_content not configured on service.peers for artifact %s", artifact_id)
+            return JSONResponse({"code": "UPSTREAM_ERROR", "error": "artifact_read_failed"}, status_code=502)
+        try:
+            eff_p = p or row.get("principal")
+            res = await reader(eff_p, matched_entry["content_ref"], row["project_id"], 16 << 20)
+            if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], (bytes, bytearray)):
+                return Response(content=bytes(res[0]), media_type=matched_entry.get("mime", "audio/wav"))
+            logging.getLogger(__name__).warning("invalid task_output_content payload for artifact %s", artifact_id)
+            return JSONResponse({"code": "UPSTREAM_ERROR", "error": "artifact_read_failed"}, status_code=502)
+        except Failure as exc:
+            logging.getLogger(__name__).warning("failed reading artifact %s: %s (status=%s)", artifact_id, exc.code, exc.status)
+            if exc.status in (403, 404):
+                return JSONResponse({"code": exc.code.upper(), "error": exc.code}, status_code=exc.status)
+            return JSONResponse({"code": "UPSTREAM_ERROR", "error": "artifact_read_failed"}, status_code=502)
+        except Exception:
+            logging.getLogger(__name__).exception("unexpected error reading artifact %s", artifact_id)
+            return JSONResponse({"code": "UPSTREAM_ERROR", "error": "artifact_read_failed"}, status_code=502)
 
     @mcp.post("/internal/content-ratings/{version_id}/clear")
     @mcp.post("/speech/internal/content-ratings/{version_id}/clear")

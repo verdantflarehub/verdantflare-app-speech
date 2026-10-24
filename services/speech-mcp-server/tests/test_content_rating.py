@@ -10,13 +10,16 @@ from unittest.mock import AsyncMock
 
 import httpx
 
-_SRC_DIR = Path(__file__).resolve().parents[1] / "src"
-if str(_SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(_SRC_DIR))
+_TESTS_DIR = Path(__file__).resolve().parent
+_SRC_DIR = _TESTS_DIR.parent / "src"
+for _p in (str(_SRC_DIR), str(_TESTS_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from speech_mcp.content_rating import ContentRatingError, ContentRatingStore
 from speech_mcp.domain import (
     SPEECH_TOOLS_SCHEMA,
+    Failure,
     TaskNotFound,
     build_text_record,
     compute_input_digest,
@@ -26,7 +29,10 @@ from speech_mcp.domain import (
 from speech_mcp.server import applications
 from speech_mcp.service import Service
 
-from tests.test_speech import MemoryStore
+try:
+    from tests.test_speech import MemoryStore
+except ModuleNotFoundError:
+    from test_speech import MemoryStore
 
 
 def _make_speech_task(p: dict[str, str], project_id: str, revision_id: str, utterance_id: str, text: str):
@@ -231,7 +237,12 @@ class TestSpeechMcpAndHttpContentRating(unittest.IsolatedAsyncioTestCase):
         self.peers = AsyncMock()
         self.peers.open.return_value = {"head_revision_id": self.revision_id, "can_write": True}
         self.peers.runtime.json.return_value = {"ready": True, "model_manifest_sha256": "a" * 64}
-        self.peers.task_output_content.return_value = (b"RIFF\x24\x00\x00\x00WAVEfmt ", {"mime": "audio/wav"})
+        self.valid_wav = (
+            b"RIFF\x2c\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+            b"\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x08\x00\x00\x00"
+            b"\x00\x00\x01\x00\xff\xff\x00\x00"
+        )
+        self.peers.task_output_content.return_value = (self.valid_wav, {"mime": "audio/wav"})
         self.svc = Service(self.store, self.peers, "a" * 64, ratings=self.ratings)
         self.token = "s" * 32
         self.app = applications(self.svc, self.token, start_worker=False)
@@ -544,6 +555,83 @@ class TestSpeechMcpAndHttpContentRating(unittest.IsolatedAsyncioTestCase):
             del2 = await client.delete(f"/api/tasks/{tid2}", headers=headers)
             self.assertEqual(del2.status_code, 200)
             self.assertEqual(del2.json(), {"status": "deleted", "task_id": tid2})
+
+    async def test_artifact_content_returns_real_wav_or_explicit_http_errors(self) -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app),
+            base_url="https://test",
+        ) as client:
+            # 1. Valid artifact returns 200 and full WAV bytes
+            ok_resp = await client.get(f"/artifacts/{self.ref_gen['version_id']}/content")
+            self.assertEqual(ok_resp.status_code, 200)
+            self.assertEqual(ok_resp.content, self.valid_wav)
+            self.assertEqual(ok_resp.headers["content-type"], "audio/wav")
+
+            # 2. Unknown artifact returns 404
+            missing_resp = await client.get(f"/artifacts/{new_id()}/content")
+            self.assertEqual(missing_resp.status_code, 404)
+            self.assertEqual(missing_resp.json()["code"], "NOT_FOUND")
+
+            # 3. Upstream Failure(503) or unexpected Exception returns 502 instead of fake 16-byte WAV header
+            self.peers.task_output_content.side_effect = Failure("dependency_unavailable", 503, True)
+            err_502 = await client.get(f"/artifacts/{self.ref_gen['version_id']}/content")
+            self.assertEqual(err_502.status_code, 502)
+            self.assertEqual(err_502.json(), {"code": "UPSTREAM_ERROR", "error": "artifact_read_failed"})
+
+            self.peers.task_output_content.side_effect = RuntimeError("storage timeout")
+            err_exc = await client.get(f"/speech/artifacts/{self.ref_gen['version_id']}/content")
+            self.assertEqual(err_exc.status_code, 502)
+            self.assertEqual(err_exc.json(), {"code": "UPSTREAM_ERROR", "error": "artifact_read_failed"})
+
+            # 4. Upstream Failure(403) or Failure(404) preserves status code
+            self.peers.task_output_content.side_effect = Failure("permission_denied", 403)
+            err_403 = await client.get(f"/artifacts/{self.ref_gen['version_id']}/content")
+            self.assertEqual(err_403.status_code, 403)
+            self.assertEqual(err_403.json()["code"], "PERMISSION_DENIED")
+
+            # 5. Entry with missing content_ref returns 404
+            self.peers.task_output_content.side_effect = None
+            self.peers.task_output_content.return_value = (self.valid_wav, {"mime": "audio/wav"})
+            no_ref_vid = new_id()
+            self.row_gen["state"]["outputs"].append(
+                {"name": "broken.wav", "version_id": no_ref_vid, "mime": "audio/wav"}
+            )
+            no_ref_resp = await client.get(f"/artifacts/{no_ref_vid}/content")
+            self.assertEqual(no_ref_resp.status_code, 404)
+            self.assertEqual(no_ref_resp.json(), {"code": "NOT_FOUND", "error": "artifact_not_found"})
+
+    async def test_dashboard_models_and_mcp_catalog_alignment(self) -> None:
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "X-Organization-Id": self.p["organization_id"],
+            "X-User-Id": self.p["subject_id"],
+            "X-Request-Id": self.p["request_id"],
+        }
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app),
+            base_url="https://test",
+        ) as client:
+            html_resp = await client.get("/internal/dashboard/assets/index.html", headers=headers)
+            self.assertEqual(html_resp.status_code, 200)
+            html_text = html_resp.text
+            self.assertIn('id="mcpToolsCountPill"', html_text)
+            self.assertIn("3 组 7 项工具", html_text)
+            self.assertNotIn("3 组 5 项工具", html_text)
+
+            mjs_resp = await client.get("/internal/dashboard/assets/dashboard.mjs", headers=headers)
+            self.assertEqual(mjs_resp.status_code, 200)
+            mjs_text = mjs_resp.text
+            self.assertNotIn('id: "whisper-small"', mjs_text)
+            for tool_name in (
+                "speech.capabilities",
+                "speech.voices",
+                "speech.create",
+                "speech.status",
+                "speech.result",
+                "speech.list",
+                "speech.rate_content",
+            ):
+                self.assertIn(tool_name, mjs_text)
 
 
 if __name__ == "__main__":
