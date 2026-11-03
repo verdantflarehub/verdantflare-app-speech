@@ -178,6 +178,26 @@ class Store:
         if n != 1:
             raise Failure("lease_lost", 409, True)
 
+    def checkpoint(self, row, *, phase=None):
+        """Persist preparation without handing the running step to a peer."""
+        target_phase = phase or row["phase"]
+        with self.connect() as c:
+            n = c.execute("""UPDATE speech_tasks SET state=%s,phase=%s,updated_at=now()
+                WHERE task_id=%s AND lease_token=%s AND lease_until>now()""",
+                          (Jsonb(row["state"]), target_phase, row["task_id"], row["lease_token"])).rowcount
+        if n != 1:
+            raise Failure("lease_lost", 409, True)
+        row["phase"] = target_phase
+
+    def gpu_active(self):
+        """Worker-only aggregate; never expose another principal's task data."""
+        with self.connect() as c:
+            return c.execute("""SELECT EXISTS (
+                SELECT 1 FROM speech_tasks WHERE state->>'gpu_held'='true'
+                AND status!='succeeded' AND phase!='complete'
+                AND NOT (status='failed' AND phase IN ('reference','loading_model'))
+                ) AS active""").fetchone()["active"]
+
     def rename_task(self, task_id: str, title: str, p=None):
         if not isinstance(title, str):
             raise Failure("invalid_arguments", 400)

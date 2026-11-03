@@ -21,3 +21,5 @@ CREATE TABLE IF NOT EXISTS speech_tasks (
 );
 CREATE INDEX IF NOT EXISTS speech_tasks_ready ON speech_tasks(next_attempt, created_at)
   WHERE status IN ('pending','running');
+CREATE INDEX IF NOT EXISTS speech_tasks_gpu_held ON speech_tasks(task_id)
+  WHERE state->>'gpu_held'='true' AND status!='succeeded';

@@ -141,6 +141,15 @@ class MemoryStore:
         self.row = copy.deepcopy(row)
         self.rows[self.row["task_id"]] = self.row
     def renew(self, row): pass
+    def checkpoint(self, row, phase=None):
+        row["phase"] = phase or row["phase"]
+        self.row = copy.deepcopy(row)
+        self.rows[row["task_id"]] = self.row
+    def gpu_active(self):
+        return any(r["state"].get("gpu_held") and r["status"] != "succeeded" and
+                   r["phase"] != "complete" and not
+                   (r["status"] == "failed" and r["phase"] in {"reference", "loading_model"})
+                   for r in self.rows.values())
     def rename_task(self, task_id: str, title: str, p=None):
         if not isinstance(title, str):
             raise Failure("invalid_arguments", 400)
@@ -357,7 +366,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.svc.gpu = SimpleNamespace(
             enabled=True,
             ready_seconds=0.01,
-            acquire_for_queue=lambda: None,
+            acquire_for_queue=lambda **kwargs: None,
             scale_to=lambda n: None,
             renew=lambda: None,
             release=lambda: None,

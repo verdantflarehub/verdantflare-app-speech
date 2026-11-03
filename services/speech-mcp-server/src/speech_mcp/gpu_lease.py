@@ -138,10 +138,7 @@ class K8sApi:
             response = self._request("PUT", path, json=body)
         else:
             response = self._request("POST", f"/apis/coordination.k8s.io/v1/namespaces/{self.namespace}/leases", json=body)
-            if response.status_code == 409:
-                current = self.get_lease(name) or {}
-                body["metadata"]["resourceVersion"] = current.get("metadata", {}).get("resourceVersion")
-                response = self._request("PUT", path, json=body)
+            # A competing creator must be re-observed, never overwritten.
         if response.status_code in {200, 201}:
             return response.status_code
         return response.status_code
@@ -193,7 +190,8 @@ class GpuCoordinator:
         self._monotonic = monotonic or time.monotonic
         self.in_flight = 0
         self.idle_at: float | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self.activity = None
 
     @property
     def lease_name(self) -> str:
@@ -267,6 +265,11 @@ class GpuCoordinator:
 
     def _write(self, holder: str) -> bool:
         current = self.api.get_lease(self.lease_name)
+        identity = ((current or {}).get("spec") or {}).get("holderIdentity")
+        if not holder and identity != self.holder:
+            return False
+        if holder and held_by_other(current, self.holder, self._now()):
+            return False
         version = None if current is None else current.get("metadata", {}).get("resourceVersion")
         acquire_time = None
         if current and (current.get("spec") or {}).get("holderIdentity") == self.holder:
@@ -281,6 +284,8 @@ class GpuCoordinator:
             current = self.api.get_lease(self.lease_name)
             if held_by_other(current, self.holder, now):
                 return False
+            if held_by_other(current, "", now) == self.holder:
+                return self._write(self.holder)
             if not self._write(self.holder):
                 return False
             if self.peer_holder():
@@ -288,17 +293,18 @@ class GpuCoordinator:
                 return False
             return True
 
-    def acquire_for_queue(self) -> None:
+    def acquire_for_queue(self, *, track: bool = True) -> None:
         if not self.enabled:
             return
         deadline = self._monotonic() + self.queue_seconds
         delay = 0.2
         while True:
-            if self.try_acquire():
-                with self._lock:
-                    self.in_flight += 1
+            with self._lock:
+                if self.try_acquire():
+                    if track:
+                        self.in_flight += 1
                     self.idle_at = None
-                return
+                    return
             if self._monotonic() >= deadline:
                 raise LeaseBusy(self.peer_holder())
             delay = min(5.0, delay * 2)
@@ -307,35 +313,63 @@ class GpuCoordinator:
     def renew(self) -> None:
         if not self.enabled:
             return
-        current = self.api.get_lease(self.lease_name)
-        identity = ((current or {}).get("spec") or {}).get("holderIdentity")
-        if identity not in {None, "", self.holder}:
+        with self._lock:
+            if self._active() and not self.try_acquire():
+                raise LeaseBusy(self.peer_holder())
+
+    def _active(self) -> bool:
+        return bool(self.in_flight or (self.activity is not None and self.activity()))
+
+    def reconcile(self) -> None:
+        if not self.enabled:
             return
-        self._write(self.holder)
+        with self._lock:
+            try:
+                active = self._active()
+            except Exception:
+                current = self.api.get_lease(self.lease_name)
+                if held_by_other(current, "", self._now()) == self.holder:
+                    self._write(self.holder)
+                raise
+            if active:
+                self.idle_at = None
+                if not self.try_acquire():
+                    raise LeaseBusy(self.peer_holder())
+                return
+            self._write("")
+            self.maybe_scale_down()
 
     def release(self) -> None:
         if not self.enabled:
             return
         with self._lock:
-            current = self.api.get_lease(self.lease_name)
-            identity = ((current or {}).get("spec") or {}).get("holderIdentity")
-            if identity in {None, "", self.holder}:
-                self._write("")
             if self.in_flight:
                 self.in_flight -= 1
-            if self.in_flight == 0:
+            if self._active():
+                self.idle_at = None
+                return
+            self._write("")
+            if self.idle_at is None:
                 self.idle_at = self._monotonic()
 
     def maybe_scale_down(self) -> None:
-        if not self.enabled or not self.deployment or self.in_flight or self.idle_at is None:
+        if not self.enabled or not self.deployment:
             return
-        if self._monotonic() - self.idle_at < self.idle_seconds:
-            return
-        current = self.api.get_lease(self.lease_name)
-        if ((current or {}).get("spec") or {}).get("holderIdentity") == self.holder:
-            return
-        if self.replicas() not in {None, 0}:
-            self.scale_to(0)
+        with self._lock:
+            if self._active():
+                self.idle_at = None
+                return
+            if self.idle_at is None:
+                self.idle_at = self._monotonic()
+            if self._monotonic() - self.idle_at < self.idle_seconds:
+                return
+            if not self._write(self.holder):
+                return
+            try:
+                if not self._active() and self.replicas() not in {None, 0}:
+                    self.scale_to(0)
+            finally:
+                self._write("")
 
     def hold(self) -> "_Hold":
         return _Hold(self)
