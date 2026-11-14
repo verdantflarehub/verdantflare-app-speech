@@ -28,7 +28,7 @@ ENV PATH="/opt/indextts/.venv/bin:$PATH" PYTHONPATH=/opt/speech-runtime PYTHONUN
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HOME=/tmp/huggingface \
     NLTK_DATA=/models/nltk_data NUMBA_CACHE_DIR=/tmp/numba MPLCONFIGDIR=/tmp/matplotlib \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
-LABEL org.opencontainers.image.version="0.1.3" org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-speech"
+LABEL org.opencontainers.image.version="0.1.7" org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-speech"
 WORKDIR /opt/indextts
 USER 10001:10001
 EXPOSE 8080

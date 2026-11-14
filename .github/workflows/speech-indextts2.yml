@@ -1,21 +1,21 @@
-name: Speech IndexTTS2 API
+name: Speech IndexTTS2
 on:
   workflow_dispatch:
   push:
     branches: [release]
     paths:
-      - services/speech-indextts2-api/**
+      - services/speech-indextts2/**
       - scripts/check-image-absent.sh
-      - .github/workflows/speech-indextts2-api.yml
+      - .github/workflows/speech-indextts2.yml
 permissions:
   contents: read
 concurrency:
-  group: speech-indextts2-api-release
+  group: speech-indextts2-release
   cancel-in-progress: false
 env:
   REGISTRY_ENDPOINT: ${{ secrets.REGISTRY_ENDPOINT_ALIYUN }}
   IMAGE_NAME: wod/verdantflare-app
-  IMAGE_VERSION: speech-indextts2-api-v0.1.6
+  IMAGE_VERSION: speech-indextts2-v0.1.7
 jobs:
   image:
     name: Build and publish speech runtime
@@ -48,11 +48,13 @@ jobs:
       - name: Build and publish release image
         uses: docker/build-push-action@v6
         with:
-          context: services/speech-indextts2-api
+          context: services/speech-indextts2
           push: true
           platforms: linux/amd64
           tags: ${{ steps.registry.outputs.image }}:${{ env.IMAGE_VERSION }}
-          cache-from: type=gha,scope=speech-indextts2-api
-          cache-to: type=gha,mode=max,scope=speech-indextts2-api
+          cache-from: |
+            type=gha,scope=speech-indextts2
+            type=gha,scope=speech-indextts2-api
+          cache-to: type=gha,mode=max,scope=speech-indextts2
           provenance: false
           sbom: false
