@@ -129,6 +129,43 @@ def _detect_visible_gpu_uuids() -> list[str]:
         return []
 
 
+def _list_container_resident_procs(
+    supervisor_pid: int,
+    proc_root: Path = Path("/proc"),
+) -> list[dict[str, int]]:
+    if not proc_root.is_dir():
+        return []
+    procs: list[dict[str, int]] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid <= 0 or pid == int(supervisor_pid):
+            continue
+        try:
+            stat_raw = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+            rparen = stat_raw.rfind(")")
+            if rparen <= 0:
+                continue
+            fields = stat_raw[rparen + 2 :].split()
+            if len(fields) <= 19 or fields[0] == "Z" or not fields[19].isdigit():
+                continue
+            ticks = int(fields[19])
+            if ticks <= 0:
+                continue
+            procs.append({"pid": pid, "starttime_ticks": ticks})
+        except (OSError, ValueError):
+            continue
+        if len(procs) >= 128:
+            break
+    procs.sort(key=lambda item: item["pid"])
+    return procs
+
+
 def read_runtime_identity() -> dict[str, object]:
     pod_uid, container_id = _detect_pod_and_container()
     return {
@@ -687,12 +724,14 @@ class LeaseFenceGuard:
             )
             is_reclaimed = bool(settled and effective_active == 0)
             consumed = resolved_token if resolved_token > 0 else self._min_fencing_token
-            return {
+            sup_pid = int(ident["supervisor_pid"])
+            resident_procs = _list_container_resident_procs(sup_pid)
+            proof: dict[str, object] = {
                 "reclaimed": is_reclaimed,
                 "active_tasks": int(effective_active),
                 "proof_source": "receiver_guard",
                 "token_sealed": True,
-                "supervisor_pid": int(ident["supervisor_pid"]),
+                "supervisor_pid": sup_pid,
                 "supervisor_starttime_ticks": int(ident["supervisor_starttime_ticks"]),
                 "sealed_pod_uid": str(ident["pod_uid"]),
                 "sealed_container_id": str(ident["container_id"]),
@@ -700,6 +739,9 @@ class LeaseFenceGuard:
                 "revoked_lease_id": resolved_lease,
                 "consumed_fencing_token": int(consumed),
             }
+            if resident_procs:
+                proof["resident_procs"] = resident_procs
+            return proof
 
     def build_warm_reclaim_proof(
         self,

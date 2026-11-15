@@ -502,3 +502,39 @@ class SpeechIndexTTS2FenceTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(r_bad.status_code, 503)
             self.assertEqual(r_bad.json()["error"]["code"], "fence_state_corrupted")
+
+    def test_reclaim_and_seal_attests_container_resident_procs(self) -> None:
+        from unittest.mock import patch
+        from speech_runtime.gpu_guard import _list_container_resident_procs
+
+        fake_proc = Path(self.tmp.name) / "fake_proc"
+        for pid, comm, state, ticks in (
+            (1, "uvicorn", "S", 10100),
+            (18, "python (tracker)", "S", 10990),
+            (25, "zombie_helper", "Z", 11050),
+        ):
+            pdir = fake_proc / str(pid)
+            pdir.mkdir(parents=True, exist_ok=True)
+            rest = ["0"] * 25
+            rest[0] = state
+            rest[19] = str(ticks)
+            (pdir / "stat").write_text(f"{pid} ({comm}) " + " ".join(rest), encoding="utf-8")
+
+        procs = _list_container_resident_procs(1, proc_root=fake_proc)
+        self.assertEqual(procs, [{"pid": 18, "starttime_ticks": 10990}])
+
+        guard = LeaseFenceGuard(state_path=Path(self.tmp.name) / "guard_res.json")
+        ident = {
+            "pod_uid": "pod-speech-res",
+            "container_id": "a" * 64,
+            "boot_id": "boot-speech-res",
+            "supervisor_pid": 1,
+            "supervisor_starttime_ticks": 10100,
+            "visible_gpu_uuids": ["GPU-aaaaaaaa-1111-2222-3333-444444444444"],
+        }
+        with patch("speech_runtime.gpu_guard._list_container_resident_procs", return_value=procs):
+            proof = guard.reclaim_and_seal(lease_id="lease-res-1", fencing_token=55, identity=ident)
+        assert proof is not None
+        self.assertEqual(proof["resident_procs"], [{"pid": 18, "starttime_ticks": 10990}])
+        self.assertEqual(proof["revoked_lease_id"], "lease-res-1")
+        self.assertEqual(proof["consumed_fencing_token"], 55)

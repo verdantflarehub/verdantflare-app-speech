@@ -325,8 +325,18 @@ class Worker:
         proof = state.get("gpu_reclaim_proof") if isinstance(state.get("gpu_reclaim_proof"), dict) else None
         target_bound = bool(lease.get("pod_uid")) if self.scheduler.enabled else bool(ident.get("pod_uid"))
 
-        # Never synthesize reclaim proof on caller side (H1); ask receiver guard if missing
-        if proof is None and target_bound and hasattr(self.peers, "runtime"):
+        def _has_complete_proof(p: object) -> bool:
+            return bool(
+                isinstance(p, dict)
+                and p.get("reclaimed") is True
+                and int(p.get("active_tasks", 1)) == 0
+                and p.get("proof_source") == "receiver_guard"
+                and p.get("token_sealed") is True
+                and str(p.get("revoked_lease_id") or "").strip() == str(lease["lease_id"]).strip()
+            )
+
+        # Never synthesize reclaim proof on caller side (H1); ask receiver guard if missing or unsealed for this lease
+        if (not _has_complete_proof(proof)) and target_bound and hasattr(self.peers, "runtime"):
             try:
                 rec_resp = await self.peers.runtime.json(
                     row["principal"],
@@ -344,13 +354,7 @@ class Worker:
             except Exception:
                 proof = None
 
-        valid_proof = bool(
-            isinstance(proof, dict)
-            and proof.get("reclaimed") is True
-            and int(proof.get("active_tasks", 1)) == 0
-            and proof.get("proof_source") == "receiver_guard"
-            and proof.get("token_sealed") is True
-        )
+        valid_proof = _has_complete_proof(proof)
         if not target_bound:
             reclaim_mode = "abort_unstarted"
             worker_settled = False
