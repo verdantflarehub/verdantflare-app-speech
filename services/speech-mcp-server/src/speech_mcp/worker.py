@@ -403,6 +403,18 @@ class Worker:
 
         replicas = await asyncio.to_thread(self.gpu.replicas) if self.gpu.enabled else 1
         slots_required = 1 if (self.gpu.enabled and self.gpu.deployment and replicas in (0, None)) else 0
+        pre_ident: dict | None = None
+        if slots_required == 0:
+            with contextlib.suppress(Exception):
+                health = await self.peers.runtime.json(
+                    row["principal"],
+                    "GET",
+                    "/health",
+                    project_id=row["project_id"],
+                )
+                if isinstance(health, dict) and isinstance(health.get("runtime_identity"), dict):
+                    pre_ident = dict(health["runtime_identity"])
+                    state["gpu_target_identity"] = pre_ident
         attempt_seq = int(state.get("gpu_attempt_seq") or 0) + 1
         state["gpu_attempt_seq"] = attempt_seq
         attempt_id = f"att-{attempt_seq}"
@@ -415,6 +427,7 @@ class Worker:
                 parent_task_id=row["task_id"],
                 attempt_id=attempt_id,
                 k8s_slots_required=slots_required,
+                runtime_identity=pre_ident,
             )
         except Exception as exc:
             raise Failure("waiting_gpu_lease", 503, True) from exc

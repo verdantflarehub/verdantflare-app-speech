@@ -417,3 +417,85 @@ class SpeechSchedulerP1bTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(SchedulerError) as e_no_store:
                 pg_no_store.release("lease-pg-nostore", 1, worker_settled=False, reclaim_mode="abort_unstarted")
             self.assertEqual(e_no_store.exception.code, "JOURNAL_STORE_REQUIRED")
+
+    async def test_warm_replica_probes_runtime_identity_before_scheduler_acquire(self) -> None:
+        _, _, row = fixture()
+        row = copy.deepcopy(row)
+        store = MemoryStore(row)
+        api = MemoryApi()
+        api.patch_scale("speech-indextts2", 1)
+        gpu = GpuCoordinator(
+            api,
+            "indextts2",
+            "speech/test",
+            deployment="speech-indextts2",
+            enabled=True,
+            queue_seconds=5,
+            ready_seconds=2,
+            idle_seconds=600,
+            now=lambda: datetime(2026, 11, 15, tzinfo=timezone.utc) + timedelta(seconds=1),
+        )
+
+        sched_calls: list[tuple[str, str, dict]] = []
+
+        def sched_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8")) if request.content else {}
+            sched_calls.append((request.method, request.url.path, body))
+            if request.url.path.endswith("/acquire"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "lease_id": "lease-warm-gpu1",
+                        "fencing_token": 91,
+                        "version": 1,
+                        "state": "leased",
+                        "attempt_id": body["attempt_id"],
+                        "stage_id": body["stage_id"],
+                        "pod_uid": body.get("pod_uid", ""),
+                        "container_id": body.get("container_id", ""),
+                        "boot_id": body.get("boot_id", ""),
+                        "gpu_uuids": body.get("candidate_gpu_uuids") or [],
+                        "expires_at": "2099-01-01T00:00:00Z",
+                    },
+                )
+            return httpx.Response(404)
+
+        sched_http = httpx.Client(transport=httpx.MockTransport(sched_handler))
+        self.addCleanup(sched_http.close)
+        scheduler = SchedulerLeaseClient(
+            base_url="http://station-runtime:5056",
+            token="sched-token",
+            enabled=True,
+            client=sched_http,
+        )
+
+        async def runtime_json(p, method, path, payload=None, **kwargs):
+            if path == "/health":
+                return {
+                    "ready": True,
+                    "runtime_identity": {
+                        "pod_uid": "pod-indextts2-gpu1",
+                        "container_id": "pod-pod-indextts2-gpu1-speech",
+                        "boot_id": "boot-node-5090",
+                        "supervisor_pid": 6200,
+                        "supervisor_starttime_ticks": 72000,
+                        "visible_gpu_uuids": ["GPU-798fb508-830f-b538-6733-72ed6d210d40"],
+                    },
+                }
+            raise AssertionError(f"unexpected path {path}")
+
+        peers = SimpleNamespace(runtime=SimpleNamespace(json=AsyncMock(side_effect=runtime_json)), open=AsyncMock())
+        with patch("speech_mcp.worker.threading.Thread.start"):
+            worker = Worker(SimpleNamespace(store=store, peers=peers, gpu=gpu, scheduler=scheduler))
+
+        await worker._ensure_gpu(row)
+        acq = [c for c in sched_calls if c[1].endswith("/acquire")]
+        binds = [c for c in sched_calls if c[1].endswith("/bind-target")]
+        self.assertEqual(len(acq), 1)
+        self.assertNotIn("k8s_slots_required", acq[0][2])
+        self.assertEqual(
+            acq[0][2]["candidate_gpu_uuids"],
+            ["GPU-798fb508-830f-b538-6733-72ed6d210d40"],
+        )
+        self.assertEqual(acq[0][2]["pod_uid"], "pod-indextts2-gpu1")
+        self.assertEqual(len(binds), 0)
