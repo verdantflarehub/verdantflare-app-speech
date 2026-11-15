@@ -33,17 +33,33 @@ class Client:
     async def close(self):
         await self.http.aclose()
 
-    async def request(self, p, method, path, payload=None, data=None, mime="application/json", project_id=None, limit=4 << 20):
+    async def request(self, p, method, path, payload=None, data=None, mime="application/json", project_id=None, limit=4 << 20, extra_headers=None):
         headers = {"Authorization": "Bearer " + self.token, "X-Organization-Id": p["organization_id"],
                    "X-User-Id": p["subject_id"], "X-Request-Id": p["request_id"], "Content-Type": mime}
         if project_id:
             headers["X-Project-Id"] = project_id
+        if isinstance(extra_headers, dict):
+            for hk, hv in extra_headers.items():
+                if hk and hv is not None and hk.lower() != "authorization":
+                    headers[str(hk)] = str(hv)
         if payload is not None:
             data = canonical(payload).encode()
         try:
             async with self.http.stream(method, self.base + path, headers=headers, content=data) as r:
                 if r.status_code >= 300:
                     if r.status_code in (401, 403):
+                        raw_auth = bytearray()
+                        async for chunk in r.aiter_bytes():
+                            raw_auth.extend(chunk)
+                            if len(raw_auth) > 4096:
+                                break
+                        if len(raw_auth) <= 4096:
+                            try:
+                                err_auth = strict_json(raw_auth).get("error", {})
+                                if isinstance(err_auth, dict) and err_auth.get("code") == "missing_or_invalid_gpu_grant":
+                                    raise Failure("missing_or_invalid_gpu_grant", 403)
+                            except (AttributeError, ValueError):
+                                pass
                         raise Failure("permission_denied", 403, True)
                     # Server details can contain internal URLs/credentials; never relay them.
                     raw = bytearray()
@@ -59,6 +75,7 @@ class Client:
                                 "recovery_required",
                                 "idempotency_conflict",
                                 "unverified_voice_engine",
+                                "stale_fencing_token",
                             ):
                                 raise Failure(err["code"], 409)
                         except (AttributeError, ValueError):

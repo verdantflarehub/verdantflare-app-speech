@@ -8,8 +8,12 @@ while held and back to 0 after the idle window. H3 stays resident.
 
 from __future__ import annotations
 
+import contextlib
+import json
+import logging
 import os
 import random
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -400,3 +404,660 @@ class _Hold:
         self._stop.set()
         self.coord.release()
         return False
+
+
+SCHEDULER_GRANTED_STATES = frozenset({"leased", "running", "granted"})
+
+
+def is_lease_granted(lease: dict | None) -> bool:
+    return isinstance(lease, dict) and str(lease.get("state") or "") in SCHEDULER_GRANTED_STATES
+
+
+class SchedulerError(RuntimeError):
+    def __init__(self, code: str, message: str = "", status_code: int = 500) -> None:
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        super().__init__(f"{code}: {message}" if message else code)
+
+
+def _fsync_directory(dir_path: Path) -> None:
+    if os.name == "nt":
+        return
+    dfd = os.open(str(dir_path), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+class SchedulerLeaseClient:
+    """HTTP client for station-runtime :5056 unified GPU lease scheduler."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str = "",
+        token: str = "",
+        holder_app_id: str = "speech-mcp",
+        enabled: bool | None = None,
+        client: httpx.Client | None = None,
+        pending_releases_path: str | Path | None = None,
+        store: object | None = None,
+        pending_releases_backend: str | None = None,
+        owner_pod_uid: str | None = None,
+        claim_seconds: int = 30,
+    ) -> None:
+        self.base_url = base_url.strip().rstrip("/")
+        self.token = token.strip()
+        self.holder_app_id = holder_app_id.strip() or "speech-mcp"
+        self.enabled = bool(self.base_url and self.token) if enabled is None else bool(enabled)
+        self._client = client
+        self._pending_lock = threading.RLock()
+        self._store = store
+        self._owner_pod_uid = (
+            str(owner_pod_uid).strip()
+            if owner_pod_uid is not None
+            else (os.environ.get("POD_UID", "").strip() or os.environ.get("HOSTNAME", "").strip())
+        )
+        self._claim_seconds = max(1, int(claim_seconds))
+
+        explicit_backend = str(pending_releases_backend or "").strip().lower()
+        env_backend = os.environ.get("STATION_GPU_PENDING_RELEASES_BACKEND", "").strip().lower()
+        env_journal = os.environ.get("STATION_GPU_PENDING_RELEASES_PATH", "").strip()
+
+        if explicit_backend:
+            resolved_backend = explicit_backend
+        elif pending_releases_path is not None:
+            resolved_backend = "file"
+        elif env_backend:
+            resolved_backend = env_backend
+        elif env_journal:
+            resolved_backend = "file"
+        elif store is not None and hasattr(store, "upsert_pending_gpu_release"):
+            resolved_backend = "postgres"
+        else:
+            resolved_backend = "file"
+
+        if resolved_backend not in {"postgres", "file"}:
+            raise SchedulerError(
+                "INVALID_JOURNAL_BACKEND",
+                f"unsupported pending releases backend: {resolved_backend!r}",
+                500,
+            )
+        self._pending_backend = resolved_backend
+
+        raw_journal = ""
+        if self._pending_backend == "file":
+            raw_journal = (
+                str(pending_releases_path).strip()
+                if pending_releases_path is not None
+                else env_journal
+            )
+        self._pending_releases_path: Path | None = Path(raw_journal) if raw_journal else None
+        self._pending_releases: dict[str, dict] = {}
+        if self._pending_backend == "file":
+            self._load_pending_releases_locked()
+
+    @classmethod
+    def from_environment(
+        cls,
+        *,
+        store: object | None = None,
+        pending_releases_path: str | Path | None = None,
+        pending_releases_backend: str | None = None,
+        owner_pod_uid: str | None = None,
+    ) -> "SchedulerLeaseClient":
+        url = os.environ.get("STATION_GPU_SCHEDULER_URL", "").strip()
+        tok = (
+            os.environ.get("STATION_GPU_SCHEDULER_TOKEN", "").strip()
+            or os.environ.get("STATION_RUNTIME_GPU_TOKEN", "").strip()
+        )
+        holder_app = os.environ.get("STATION_GPU_HOLDER_APP_ID", "speech-mcp").strip() or "speech-mcp"
+        explicit_backend = str(pending_releases_backend or "").strip().lower()
+        env_backend = os.environ.get("STATION_GPU_PENDING_RELEASES_BACKEND", "").strip().lower()
+        env_journal = os.environ.get("STATION_GPU_PENDING_RELEASES_PATH", "").strip()
+
+        if explicit_backend:
+            backend = explicit_backend
+        elif pending_releases_path is not None:
+            backend = "file"
+        elif env_backend:
+            backend = env_backend
+        elif env_journal:
+            backend = "file"
+        elif store is not None and hasattr(store, "upsert_pending_gpu_release"):
+            backend = "postgres"
+        else:
+            backend = "file"
+
+        resolved_journal: str | Path | None = None
+        if backend == "file":
+            default_dir = Path("/data/speech-mcp") if Path("/data").is_dir() else Path(tempfile.gettempdir())
+            resolved_journal = env_journal or pending_releases_path or (default_dir / "gpu_pending_releases.json")
+
+        return cls(
+            base_url=url,
+            token=tok,
+            holder_app_id=holder_app,
+            pending_releases_path=resolved_journal,
+            store=store,
+            pending_releases_backend=backend,
+            owner_pod_uid=owner_pod_uid,
+        )
+
+    def attach_store(self, store: object | None) -> None:
+        if store is None:
+            return
+        with self._pending_lock:
+            self._store = store
+            if (
+                self._pending_backend == "file"
+                and self._pending_releases_path is None
+                and hasattr(store, "upsert_pending_gpu_release")
+            ):
+                self._pending_backend = "postgres"
+
+    def _require_pg_store(self):
+        store = self._store
+        if store is None or not hasattr(store, "upsert_pending_gpu_release"):
+            raise SchedulerError(
+                "JOURNAL_STORE_REQUIRED",
+                "postgres pending releases backend requires a PostgreSQL Store",
+                503,
+            )
+        return store
+
+    def _load_pending_releases_locked(self) -> None:
+        if self._pending_releases_path is None or not os.path.lexists(self._pending_releases_path):
+            return
+        if os.path.islink(self._pending_releases_path) or not self._pending_releases_path.is_file():
+            raise SchedulerError("JOURNAL_CORRUPTED", "pending releases journal is not a regular file", 503)
+        try:
+            payload = json.loads(self._pending_releases_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SchedulerError("JOURNAL_CORRUPTED", f"failed reading pending releases journal: {exc}", 503) from exc
+        if not isinstance(payload, dict):
+            raise SchedulerError("JOURNAL_CORRUPTED", "pending releases journal root must be an object", 503)
+        loaded: dict[str, dict] = {}
+        for k, v in payload.items():
+            if not isinstance(k, str) or not k.strip() or not isinstance(v, dict):
+                raise SchedulerError("JOURNAL_CORRUPTED", "invalid pending release journal entry", 503)
+            loaded[k.strip()] = dict(v)
+        self._pending_releases = loaded
+
+    def _persist_pending_releases_locked(self) -> None:
+        if self._pending_releases_path is None:
+            return
+        self._pending_releases_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._pending_releases_path.with_name(
+            f"{self._pending_releases_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        data = json.dumps(self._pending_releases, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        try:
+            fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("short_write_zero_bytes")
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(str(tmp_path), str(self._pending_releases_path))
+            _fsync_directory(self._pending_releases_path.parent)
+        except OSError as exc:
+            try:
+                if os.path.lexists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise SchedulerError("JOURNAL_PERSIST_FAILED", str(exc), 503) from exc
+
+    @staticmethod
+    def _is_confirmed_release_receipt(lease_id: str, data: object) -> bool:
+        if not isinstance(data, dict):
+            return False
+        if str(data.get("lease_id") or "").strip() != lease_id:
+            return False
+        return str(data.get("state") or "").strip().lower() in ("released", "expired")
+
+    def _request_raw(self, method: str, path: str, payload: dict | None = None) -> httpx.Response:
+        headers = {"Authorization": f"Bearer {self.token}"}
+        if self._client is not None:
+            return self._client.request(method, self.base_url + path, json=payload, headers=headers, timeout=15.0)
+        with httpx.Client(timeout=15.0, trust_env=False) as http:
+            return http.request(method, self.base_url + path, json=payload, headers=headers)
+
+    @staticmethod
+    def _parse_error(resp: httpx.Response) -> SchedulerError:
+        code = f"HTTP_{resp.status_code}"
+        msg = resp.text
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError:
+            data = {}
+        if isinstance(data, dict):
+            top_code = data.get("error_code")
+            top_msg = data.get("message")
+            nested = data.get("error")
+            if isinstance(top_code, str) and top_code:
+                code = top_code
+                if isinstance(top_msg, str) and top_msg:
+                    msg = top_msg
+            elif isinstance(nested, dict):
+                if isinstance(nested.get("code"), str) and nested["code"]:
+                    code = nested["code"]
+                if isinstance(nested.get("message"), str) and nested["message"]:
+                    msg = nested["message"]
+        return SchedulerError(code, msg, status_code=resp.status_code)
+
+    def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        try:
+            resp = self._request_raw(method, path, payload)
+        except SchedulerError:
+            raise
+        except Exception as exc:
+            raise SchedulerError("TRANSPORT_ERROR", str(exc), status_code=503) from exc
+        if resp.status_code >= 400:
+            raise self._parse_error(resp)
+        return resp.json() if resp.content else {}
+
+    def get_pending_release(self, lease_id: str) -> dict | None:
+        if self._pending_backend == "postgres":
+            store = self._require_pg_store()
+            row = store.get_pending_gpu_release(lease_id)
+            if not row:
+                return None
+            payload = dict(row.get("payload") or {}) if isinstance(row.get("payload"), dict) else {}
+            payload["_status"] = str(row.get("status") or "pending")
+            payload["_quarantined_400"] = payload["_status"] == "quarantined_400"
+            payload["_last_error"] = str(row.get("last_error") or "")
+            payload["_owner_pod_uid"] = str(row.get("owner_pod_uid") or "")
+            return payload
+        with self._pending_lock:
+            entry = self._pending_releases.get(lease_id)
+            return dict(entry) if isinstance(entry, dict) else None
+
+    def flush_pending_releases(self, *, include_quarantined: bool = False) -> int:
+        if not self.enabled:
+            return 0
+        if self._pending_backend == "postgres":
+            store = self._require_pg_store()
+            flushed = 0
+            visited: list[str] = []
+            # Claim strictly 1 row at a time right before sending HTTP so queued items never burn claim_until
+            for _ in range(32):
+                row = store.claim_next_pending_gpu_release(
+                    owner_pod_uid=self._owner_pod_uid,
+                    include_quarantined=include_quarantined,
+                    claim_seconds=self._claim_seconds,
+                    exclude_lease_ids=visited,
+                )
+                if not row:
+                    break
+                lease_id = str(row.get("lease_id") or "").strip()
+                visited.append(lease_id)
+                claim_token = str(row.get("claim_token") or "")
+                payload_version = int(row.get("payload_version") or 1)
+                raw_body = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+                retry_body = {
+                    k: v
+                    for k, v in raw_body.items()
+                    if k != "expected_version" and not str(k).startswith("_")
+                }
+                try:
+                    resp = self._request_raw(
+                        "POST",
+                        f"/internal/v1/gpu-scheduler/leases/{lease_id}/release",
+                        retry_body,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json() if resp.content else {}
+                        if self._is_confirmed_release_receipt(lease_id, data):
+                            if store.delete_pending_gpu_release(
+                                lease_id,
+                                claim_token=claim_token,
+                                payload_version=payload_version,
+                            ):
+                                flushed += 1
+                            continue
+                    elif resp.status_code == 400:
+                        err = self._parse_error(resp)
+                        logging.error(
+                            "speech_gpu_release_quarantined_400 lease_id=%s code=%s message=%s",
+                            lease_id,
+                            err.code,
+                            err.message,
+                        )
+                        store.quarantine_pending_gpu_release(
+                            lease_id,
+                            f"{err.code}:{err.message}",
+                            claim_token=claim_token,
+                            payload_version=payload_version,
+                        )
+                        continue
+                    store.release_pending_gpu_claim(
+                        lease_id,
+                        claim_token=claim_token,
+                        payload_version=payload_version,
+                    )
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        store.release_pending_gpu_claim(
+                            lease_id,
+                            claim_token=claim_token,
+                            payload_version=payload_version,
+                        )
+                    continue
+            return flushed
+
+        with self._pending_lock:
+            if not self._pending_releases:
+                return 0
+            snapshot = [
+                (lid, dict(b))
+                for lid, b in self._pending_releases.items()
+                if include_quarantined or not bool(b.get("_quarantined_400"))
+            ]
+        if not snapshot:
+            return 0
+        flushed = 0
+        for lease_id, body in snapshot:
+            retry_body = {
+                k: v
+                for k, v in body.items()
+                if k != "expected_version" and not str(k).startswith("_")
+            }
+            try:
+                resp = self._request_raw("POST", f"/internal/v1/gpu-scheduler/leases/{lease_id}/release", retry_body)
+                if resp.status_code == 200:
+                    data = resp.json() if resp.content else {}
+                    if self._is_confirmed_release_receipt(lease_id, data):
+                        with self._pending_lock:
+                            self._pending_releases.pop(lease_id, None)
+                            self._persist_pending_releases_locked()
+                        flushed += 1
+                elif resp.status_code == 400:
+                    err = self._parse_error(resp)
+                    logging.error(
+                        "speech_gpu_release_quarantined_400 lease_id=%s code=%s message=%s",
+                        lease_id,
+                        err.code,
+                        err.message,
+                    )
+                    with self._pending_lock:
+                        cur = self._pending_releases.get(lease_id)
+                        if isinstance(cur, dict):
+                            upd = dict(cur)
+                            upd["_quarantined_400"] = True
+                            upd["_last_error"] = f"{err.code}:{err.message}"
+                            self._pending_releases[lease_id] = upd
+                            self._persist_pending_releases_locked()
+            except Exception:
+                continue
+        return flushed
+
+    def acquire(
+        self,
+        *,
+        parent_task_id: str,
+        attempt_id: str,
+        stage_id: str = "indextts2_inference",
+        vram_budget_mib: int = 6144,
+        k8s_slots_required: int = 0,
+        lease_ttl_seconds: int = 120,
+        runtime_identity: dict | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        self.flush_pending_releases()
+        ident = runtime_identity or {}
+        body: dict[str, object] = {
+            "idempotency_key": idempotency_key or f"acq:{parent_task_id}:{attempt_id}:{stage_id}",
+            "holder_app_id": self.holder_app_id,
+            "consumer_kind": "indextts2",
+            "task_id": parent_task_id,
+            "attempt_id": attempt_id,
+            "stage_id": stage_id,
+            "card_count": 1,
+            "peak_budget_mib": int(vram_budget_mib),
+            "priority_class": "shared_slice",
+            "ttl_seconds": int(lease_ttl_seconds),
+        }
+        if k8s_slots_required > 0:
+            body["k8s_slots_required"] = int(k8s_slots_required)
+        for key in ("pod_uid", "container_id", "boot_id"):
+            val = ident.get(key)
+            if isinstance(val, str) and val and not val.startswith("unknown-"):
+                body[key] = val
+        visible = ident.get("visible_gpu_uuids")
+        if isinstance(visible, list) and visible:
+            body["candidate_gpu_uuids"] = [str(u) for u in visible if str(u)]
+        return self._request("POST", "/internal/v1/gpu-scheduler/leases/acquire", body)
+
+    def get_lease(self, lease_id: str) -> dict:
+        return self._request("GET", f"/internal/v1/gpu-scheduler/leases/{lease_id}")
+
+    def bind_target(
+        self,
+        lease_id: str,
+        fencing_token: int,
+        *,
+        runtime_identity: dict,
+        expected_version: int = 0,
+        lease_ttl_seconds: int = 120,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        pod_uid = str(runtime_identity.get("pod_uid") or "").strip()
+        container_id = str(runtime_identity.get("container_id") or "").strip()
+        boot_id = str(runtime_identity.get("boot_id") or "").strip()
+        if not pod_uid or not container_id or not boot_id or pod_uid.startswith("unknown-"):
+            raise SchedulerError("INVALID_TARGET_IDENTITY", "bind_target requires concrete pod_uid, container_id, boot_id", 400)
+        visible = runtime_identity.get("visible_gpu_uuids") or []
+        actual_gpus = [str(u) for u in visible if str(u)] if isinstance(visible, (list, tuple)) else []
+        body: dict[str, object] = {
+            "idempotency_key": idempotency_key or f"bind:{lease_id}:{fencing_token}:{pod_uid}",
+            "fencing_token": int(fencing_token),
+            "ttl_seconds": int(lease_ttl_seconds),
+            "pod_uid": pod_uid,
+            "container_id": container_id,
+            "boot_id": boot_id,
+        }
+        if expected_version > 0:
+            body["expected_version"] = int(expected_version)
+        if actual_gpus:
+            body["actual_gpu_uuids"] = actual_gpus
+        return self._request("POST", f"/internal/v1/gpu-scheduler/leases/{lease_id}/bind-target", body)
+
+    def heartbeat(
+        self,
+        lease_id: str,
+        fencing_token: int,
+        *,
+        lease_ttl_seconds: int = 120,
+        expected_version: int = 0,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        body: dict[str, object] = {
+            "idempotency_key": idempotency_key or f"hb:{lease_id}:{fencing_token}:{int(time.time() // 15)}",
+            "fencing_token": int(fencing_token),
+            "ttl_seconds": int(lease_ttl_seconds),
+        }
+        if expected_version > 0:
+            body["expected_version"] = int(expected_version)
+        return self._request(
+            "POST",
+            f"/internal/v1/gpu-scheduler/leases/{lease_id}/heartbeat",
+            body,
+        )
+
+    def release(
+        self,
+        lease_id: str,
+        fencing_token: int,
+        *,
+        reclaim_proof: dict | None = None,
+        target_identity: dict | None = None,
+        reason: str = "task_settled",
+        worker_settled: bool = True,
+        reclaim_mode: str = "warm_idle_settled",
+        expected_version: int = 0,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        _ = reason
+        ident = target_identity or {}
+        body: dict[str, object] = {
+            "idempotency_key": idempotency_key or f"rel:{lease_id}:{fencing_token}:{reclaim_mode or 'plain'}",
+            "fencing_token": int(fencing_token),
+            "worker_settled": bool(worker_settled),
+        }
+        if expected_version > 0:
+            body["expected_version"] = int(expected_version)
+        if reclaim_mode:
+            body["reclaim_mode"] = reclaim_mode
+        if reclaim_proof:
+            body["reclaim_proof"] = reclaim_proof
+        if isinstance(ident.get("supervisor_pid"), int) and ident["supervisor_pid"] > 0:
+            body["supervisor_pid"] = int(ident["supervisor_pid"])
+        if isinstance(ident.get("supervisor_starttime_ticks"), int) and ident["supervisor_starttime_ticks"] > 0:
+            body["supervisor_starttime_ticks"] = int(ident["supervisor_starttime_ticks"])
+        for key in ("pod_uid", "container_id", "boot_id"):
+            val = ident.get(key)
+            if isinstance(val, str) and val and not val.startswith("unknown-"):
+                body[key] = val
+        retry_body = {k: v for k, v in body.items() if k != "expected_version"}
+        pg_claim_token: str = ""
+        pg_payload_version: int = 0
+        if self._pending_backend == "postgres":
+            store = self._require_pg_store()
+            try:
+                pg_claim_token, pg_payload_version = store.upsert_pending_gpu_release(
+                    lease_id,
+                    int(fencing_token),
+                    retry_body,
+                    owner_pod_uid=self._owner_pod_uid,
+                    claim_seconds=self._claim_seconds,
+                )
+            except Exception as exc:
+                if getattr(exc, "code", "") == "pending_gpu_release_claimed_or_stale":
+                    raise SchedulerError("RELEASE_CLAIM_CONFLICT", str(exc), 409) from exc
+                raise
+        else:
+            with self._pending_lock:
+                self._pending_releases[lease_id] = retry_body
+                self._persist_pending_releases_locked()
+        try:
+            resp = self._request_raw("POST", f"/internal/v1/gpu-scheduler/leases/{lease_id}/release", body)
+        except Exception as exc:
+            if self._pending_backend == "postgres" and pg_claim_token:
+                with contextlib.suppress(Exception):
+                    self._require_pg_store().release_pending_gpu_claim(
+                        lease_id,
+                        claim_token=pg_claim_token,
+                        payload_version=pg_payload_version,
+                    )
+            raise SchedulerError("RELEASE_TRANSPORT_FAILED", str(exc), 503) from exc
+        if resp.status_code != 200:
+            err = self._parse_error(resp)
+            if resp.status_code == 400:
+                logging.error(
+                    "speech_gpu_release_quarantined_400 lease_id=%s code=%s message=%s",
+                    lease_id,
+                    err.code,
+                    err.message,
+                )
+                if self._pending_backend == "postgres":
+                    self._require_pg_store().quarantine_pending_gpu_release(
+                        lease_id,
+                        f"{err.code}:{err.message}",
+                        claim_token=pg_claim_token,
+                        payload_version=pg_payload_version,
+                    )
+                else:
+                    with self._pending_lock:
+                        cur = self._pending_releases.get(lease_id)
+                        if isinstance(cur, dict):
+                            upd = dict(cur)
+                            upd["_quarantined_400"] = True
+                            upd["_last_error"] = f"{err.code}:{err.message}"
+                            self._pending_releases[lease_id] = upd
+                            self._persist_pending_releases_locked()
+            elif self._pending_backend == "postgres" and pg_claim_token:
+                with contextlib.suppress(Exception):
+                    self._require_pg_store().release_pending_gpu_claim(
+                        lease_id,
+                        claim_token=pg_claim_token,
+                        payload_version=pg_payload_version,
+                    )
+            raise err
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError:
+            data = {}
+        if not self._is_confirmed_release_receipt(lease_id, data):
+            if self._pending_backend == "postgres" and pg_claim_token:
+                with contextlib.suppress(Exception):
+                    self._require_pg_store().release_pending_gpu_claim(
+                        lease_id,
+                        claim_token=pg_claim_token,
+                        payload_version=pg_payload_version,
+                    )
+            state = data.get("state") if isinstance(data, dict) else None
+            raise SchedulerError("RELEASE_NOT_TERMINAL", f"Unconfirmed release receipt for {lease_id}: state={state!r}", 502)
+        if self._pending_backend == "postgres":
+            self._require_pg_store().delete_pending_gpu_release(
+                lease_id,
+                claim_token=pg_claim_token,
+                payload_version=pg_payload_version,
+            )
+        else:
+            with self._pending_lock:
+                self._pending_releases.pop(lease_id, None)
+                self._persist_pending_releases_locked()
+        return data
+
+    def build_grant_headers(
+        self,
+        lease: dict | None,
+        *,
+        parent_task_id: str,
+        target_identity: dict | None = None,
+    ) -> dict[str, str]:
+        if not self.enabled or not is_lease_granted(lease):
+            return {}
+        ident = target_identity or {}
+        assigned = lease.get("gpu_uuids") or lease.get("assigned_gpu_uuids") or []
+        gpu_uuids = [str(u) for u in assigned if str(u)] if isinstance(assigned, (list, tuple)) else []
+        if not gpu_uuids and lease.get("gpu_uuid"):
+            gpu_uuids = [str(lease["gpu_uuid"])]
+        visible = ident.get("visible_gpu_uuids") or []
+        if not gpu_uuids and visible:
+            gpu_uuids = [str(visible[0])]
+        headers = {
+            "X-VF-GPU-Lease-ID": str(lease["lease_id"]),
+            "X-VF-GPU-Fencing-Token": str(lease["fencing_token"]),
+            "X-VF-GPU-Attempt-ID": str(lease.get("attempt_id") or "att-1"),
+            "X-VF-GPU-Stage-ID": str(lease.get("stage_id") or "indextts2_inference"),
+            "X-VF-GPU-Parent-Task-ID": str(parent_task_id),
+            "X-VF-GPU-Consumer-Kind": "indextts2",
+            "X-VF-GPU-Holder-App-ID": self.holder_app_id,
+        }
+        pod_uid = str(lease.get("pod_uid") or ident.get("pod_uid") or "")
+        container_id = str(lease.get("container_id") or ident.get("container_id") or "")
+        boot_id = str(lease.get("boot_id") or ident.get("boot_id") or "")
+        if pod_uid and not pod_uid.startswith("unknown-"):
+            headers["X-VF-GPU-Pod-UID"] = pod_uid
+        if container_id and not container_id.startswith("unknown-"):
+            headers["X-VF-GPU-Container-ID"] = container_id
+        if boot_id and not boot_id.startswith("unknown-"):
+            headers["X-VF-GPU-Boot-ID"] = boot_id
+        if gpu_uuids:
+            headers["X-VF-GPU-UUID"] = ",".join(gpu_uuids)
+        expires_at = str(lease.get("expires_at") or "")
+        if not expires_at:
+            expires_at = format_time(datetime.now(timezone.utc) + timedelta(seconds=120))
+        headers["X-VF-GPU-Expires-At"] = expires_at
+        return headers
+

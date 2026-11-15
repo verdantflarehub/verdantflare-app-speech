@@ -1,4 +1,5 @@
 import contextlib
+import gc
 import inspect
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 from .asr import WhisperSmallASR
 from .audio import TRUE_PEAK_CEILING_DBTP, digest_file, editing_copy, inspect_wav, quality_warnings
 from .domain import Failure, canonical
+from .gpu_guard import FencePersistenceError, StaleFenceError
 from .store import atomic_write
 
 
@@ -81,15 +83,30 @@ class IndexEngine:
                 "device_name": torch.cuda.get_device_name(0),
                 "resolved_emotion_vector": resolved_emotion_vector}
 
+    def unload(self):
+        self.model = None
+        if hasattr(self.asr, "model"):
+            self.asr.model = None
+        if hasattr(self.asr, "ready"):
+            self.asr.ready = False
+        gc.collect()
+        with contextlib.suppress(Exception):
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
 
 class Worker:
-    def __init__(self, store, engine, converter=editing_copy):
+    def __init__(self, store, engine, converter=editing_copy, fence=None):
         self.store, self.engine, self.converter = store, engine, converter
+        self.fence = fence
         self.stop = threading.Event()
         self.wake = threading.Event()
         self.ready = False
         self.error = None
         self.thread = None
+        self._gpu_lock = threading.Lock()
 
     def start(self):
         self.thread = threading.Thread(target=self.run, name="speech-gpu-worker", daemon=True)
@@ -137,8 +154,19 @@ class Worker:
                 raise Failure("stored_reference_corrupt", 409)
             if emo_reference is not None and digest_file(emo_reference) != inputs["emotion_reference"]["reference_sha256"]:
                 raise Failure("stored_reference_corrupt", 409)
+            if self.fence is not None:
+                try:
+                    self.fence.verify_before_inference(task_id)
+                except FencePersistenceError as exc:
+                    raise Failure("fence_state_corrupted", 503) from exc
+                except StaleFenceError as exc:
+                    raise Failure("stale_fencing_token", 409) from exc
             original = root / "original.wav"
-            compute = dict(self._call_generate(reference, inputs, original, emo_reference) or {})
+            with self._gpu_lock:
+                if not self.ready and hasattr(self.engine, "load"):
+                    self.engine.load()
+                    self.ready = True
+                compute = dict(self._call_generate(reference, inputs, original, emo_reference) or {})
             resolved_emotion = compute.pop(
                 "resolved_emotion_vector",
                 _normalize_resolved_vector(inputs["emotion_vector"]) if "emotion_vector" in inputs else None,
@@ -197,8 +225,9 @@ class Worker:
             outputs = []
             for name in ("original.wav", "editing.wav", "report.json"):
                 path = root / name
-                with path.open("rb") as f:
-                    os.fsync(f.fileno())
+                if os.name != "nt":
+                    with path.open("rb") as f:
+                        os.fsync(f.fileno())
                 outputs.append({"name": name, "sha256": digest_file(path), "size": path.stat().st_size,
                                 "mime": "application/json" if name.endswith(".json") else "audio/wav"})
             atomic_write(root / "complete.json", canonical({"task_id": task_id, "model_manifest_sha256": row["model_hash"], "outputs": outputs}).encode())
@@ -207,6 +236,25 @@ class Worker:
             self.store.fail(task_id, error.code)
         except Exception:
             self.store.fail(task_id, "inference_failed")
+        finally:
+            if self.fence is not None and hasattr(self.fence, "seal_task"):
+                self.fence.seal_task(task_id)
+
+    def evict_idle_vram(self) -> bool:
+        if not self._gpu_lock.acquire(blocking=False):
+            return False
+        try:
+            with self.store.mutex:
+                if self.store.active_count() > 0:
+                    return False
+                if self.fence is not None and hasattr(self.fence, "active_inflight_count") and self.fence.active_inflight_count() > 0:
+                    return False
+            if hasattr(self.engine, "unload"):
+                self.engine.unload()
+            self.ready = False
+            return True
+        finally:
+            self._gpu_lock.release()
 
     def shutdown(self):
         self.stop.set()

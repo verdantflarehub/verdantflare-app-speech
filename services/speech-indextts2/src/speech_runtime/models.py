@@ -1,6 +1,5 @@
 """Explicit model preparation and offline verification; never used to fetch at inference."""
 import concurrent.futures
-import fcntl
 import hashlib
 import http.client
 import json
@@ -16,7 +15,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 from .audio import digest_file
-from .store import atomic_write
+from .store import _lock_file_nonblocking, _unlock_file, atomic_write
 
 BUNDLED_MANIFEST = Path(os.environ.get("SPEECH_MODEL_MANIFEST", "/opt/service/models/manifest.lock.json"))
 BUNDLED_SOURCES = Path("/opt/service/models/download-sources.lock.json")
@@ -153,12 +152,16 @@ def extract_resource(root, item, verify_only=False):
 def prepare_models(root, manifest_path=BUNDLED_MANIFEST):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    with (root / ".prepare.lock").open("a") as lock:
+    lock_path = root / ".prepare.lock"
+    with lock_path.open("r+" if lock_path.exists() else "w+") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            _lock_file_nonblocking(lock)
+        except OSError:
             raise RuntimeError("model_preparation_already_active") from None
-        _prepare_models(root, manifest_path)
+        try:
+            _prepare_models(root, manifest_path)
+        finally:
+            _unlock_file(lock)
 
 
 def _prepare_models(root, manifest_path):

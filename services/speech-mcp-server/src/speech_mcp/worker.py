@@ -16,7 +16,7 @@ from .domain import (
     strict_json,
     validate,
 )
-from .gpu_lease import GpuCoordinator, LeaseBusy
+from .gpu_lease import GpuCoordinator, LeaseBusy, SchedulerLeaseClient, is_lease_granted
 
 log = logging.getLogger("speech_worker")
 
@@ -25,17 +25,32 @@ class Worker:
     def __init__(self, service):
         self.service, self.store, self.peers = service, service.store, service.peers
         self.gpu = getattr(service, "gpu", None) or GpuCoordinator.from_environment()
-        if self.gpu.enabled:
-            self.gpu.activity = self.store.gpu_active
+        existing_sched = getattr(service, "scheduler", None)
+        if existing_sched is not None:
+            if hasattr(existing_sched, "attach_store"):
+                existing_sched.attach_store(self.store)
+            self.scheduler = existing_sched
+        else:
+            self.scheduler = SchedulerLeaseClient.from_environment(store=self.store)
+        self._last_pending_flush = 0.0
+        if self.gpu.enabled or self.scheduler.enabled:
+            if self.gpu.enabled:
+                self.gpu.activity = self.store.gpu_active
             threading.Thread(target=self._idle, name="speech-gpu-idle", daemon=True).start()
 
     def _idle(self):
         while True:
             time.sleep(30)
-            try:
-                self.gpu.reconcile()
-            except Exception:
-                log.error("speech_gpu_idle_scale_failed")
+            if self.scheduler.enabled:
+                try:
+                    self.scheduler.flush_pending_releases()
+                except Exception:
+                    log.error("speech_scheduler_pending_release_flush_failed")
+            if self.gpu.enabled:
+                try:
+                    self.gpu.reconcile()
+                except Exception:
+                    log.error("speech_gpu_idle_scale_failed")
 
     async def renew(self, row):
         while True:
@@ -46,10 +61,30 @@ class Worker:
                     await asyncio.to_thread(self.gpu.renew)
                 except LeaseBusy as error:
                     raise Failure("waiting_gpu_lease", 503, True) from error
+            sched_lease = row["state"].get("gpu_scheduler_lease")
+            if self.scheduler.enabled and is_lease_granted(sched_lease):
+                try:
+                    renewed = await asyncio.to_thread(
+                        self.scheduler.heartbeat,
+                        str(sched_lease["lease_id"]),
+                        int(sched_lease["fencing_token"]),
+                    )
+                    if isinstance(renewed, dict) and renewed.get("lease_id"):
+                        row["state"]["gpu_scheduler_lease"] = renewed
+                except Exception as error:
+                    raise Failure("waiting_gpu_lease", 503, True) from error
 
     async def run(self):
+        if self.scheduler.enabled:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(self.scheduler.flush_pending_releases)
+            self._last_pending_flush = time.monotonic()
         while True:
             try:
+                if self.scheduler.enabled and (time.monotonic() - self._last_pending_flush) >= 10.0:
+                    self._last_pending_flush = time.monotonic()
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(self.scheduler.flush_pending_releases)
                 row = await asyncio.to_thread(self.store.claim)
                 if row:
                     await self.process(row)
@@ -71,11 +106,20 @@ class Worker:
                 await heartbeat
             await operation
         except Failure as error:
+            can_release_sched = (
+                not error.retry
+                and (
+                    row["phase"] in {"reference", "loading_model", "submit"}
+                    or row["state"].get("gpu_execution_finished") is True
+                )
+            )
             release_gpu = (not error.retry and self.gpu.enabled and
                            (row["phase"] in {"reference", "loading_model"} or
                             row["state"].get("gpu_execution_finished") is True))
             if release_gpu:
                 row["state"].pop("gpu_held", None)
+            if can_release_sched:
+                await self._release_scheduler_lease(row, reason=f"failed:{error.code}")
             if error.code != "lease_lost":
                 await asyncio.to_thread(self.store.save, row,
                                         status="running" if error.retry else "failed", error=error.code, delay=15)
@@ -150,7 +194,13 @@ class Worker:
             if caps.get("model_manifest_sha256") != state["profile"]["model_manifest_sha256"]:
                 raise Failure("model_version_changed", 409)
             state["submit_started_at"] = time.time()
-            task = await self.peers.runtime.json(p, "POST", "/v1/tasks", state["runtime_inputs"], project_id=pid)
+            grant_headers = self.scheduler.build_grant_headers(
+                state.get("gpu_scheduler_lease"),
+                parent_task_id=row["task_id"],
+                target_identity=state.get("gpu_target_identity"),
+            )
+            extra_kw = {"extra_headers": grant_headers} if grant_headers else {}
+            task = await self.peers.runtime.json(p, "POST", "/v1/tasks", state["runtime_inputs"], project_id=pid, **extra_kw)
             validate("id", task.get("task_id"))
             state["runtime_task_id"] = task["task_id"]
             await self.save(row, phase="inference", delay=2)
@@ -160,9 +210,12 @@ class Worker:
                 raise Failure("runtime_identity_mismatch", 502)
             if task["status"] in {"failed", "succeeded"}:
                 state["gpu_execution_finished"] = True
+                if isinstance(task.get("reclaim_proof"), dict):
+                    state["gpu_reclaim_proof"] = task["reclaim_proof"]
+                await self._release_scheduler_lease(row, reason=f"inference_{task['status']}")
             if task["status"] == "failed":
                 code = task.get("error", {}).get("code")
-                raise Failure(code if code in ("recovery_required", "model_version_changed") else "inference_failed", 409)
+                raise Failure(code if code in ("recovery_required", "model_version_changed", "stale_fencing_token") else "inference_failed", 409)
             if task["status"] != "succeeded":
                 await self.save(row, delay=2)
                 return
@@ -218,6 +271,7 @@ class Worker:
             entry = next((x for x in state["archive_entries"] if x["name"] not in complete), None)
             if entry is None:
                 release_gpu = self.gpu.enabled and state.pop("gpu_held", False)
+                await self._release_scheduler_lease(row, reason="task_succeeded")
                 await self.save(row, phase="complete", status="succeeded")
                 if release_gpu:
                     await asyncio.to_thread(self.gpu.release)
@@ -260,20 +314,173 @@ class Worker:
         else:
             raise Failure("invalid_task_phase", 500)
 
+    async def _release_scheduler_lease(self, row, *, reason: str = "task_settled") -> None:
+        state = row["state"]
+        lease = state.get("gpu_scheduler_lease")
+        if not self.scheduler.enabled or not isinstance(lease, dict) or not lease.get("lease_id"):
+            state.pop("gpu_scheduler_lease", None)
+            state.pop("gpu_queue", None)
+            return
+        ident = state.get("gpu_target_identity") if isinstance(state.get("gpu_target_identity"), dict) else {}
+        proof = state.get("gpu_reclaim_proof") if isinstance(state.get("gpu_reclaim_proof"), dict) else None
+        target_bound = bool(lease.get("pod_uid")) if self.scheduler.enabled else bool(ident.get("pod_uid"))
+
+        # Never synthesize reclaim proof on caller side (H1); ask receiver guard if missing
+        if proof is None and target_bound and hasattr(self.peers, "runtime"):
+            try:
+                rec_resp = await self.peers.runtime.json(
+                    row["principal"],
+                    "POST",
+                    "/internal/v1/gpu-guard/reclaim",
+                    {
+                        "lease_id": str(lease["lease_id"]),
+                        "fencing_token": int(lease.get("fencing_token") or 0),
+                        "task_id": str(state.get("runtime_task_id") or ""),
+                    },
+                    project_id=row["project_id"],
+                )
+                if isinstance(rec_resp, dict) and isinstance(rec_resp.get("reclaim_proof"), dict):
+                    proof = rec_resp["reclaim_proof"]
+            except Exception:
+                proof = None
+
+        valid_proof = bool(
+            isinstance(proof, dict)
+            and proof.get("reclaimed") is True
+            and int(proof.get("active_tasks", 1)) == 0
+            and proof.get("proof_source") == "receiver_guard"
+            and proof.get("token_sealed") is True
+        )
+        if not target_bound:
+            reclaim_mode = "abort_unstarted"
+            worker_settled = False
+            send_proof = None
+        elif valid_proof:
+            reclaim_mode = "warm_idle_settled"
+            worker_settled = True
+            send_proof = proof
+        else:
+            reclaim_mode = ""
+            worker_settled = False
+            send_proof = None
+
+        try:
+            await asyncio.to_thread(
+                self.scheduler.release,
+                str(lease["lease_id"]),
+                int(lease.get("fencing_token") or 0),
+                reclaim_proof=send_proof,
+                target_identity=ident if target_bound else None,
+                reason=reason,
+                worker_settled=worker_settled,
+                reclaim_mode=reclaim_mode,
+                expected_version=int(lease.get("version") or 0),
+            )
+            state.pop("gpu_scheduler_lease", None)
+            state.pop("gpu_queue", None)
+        except Exception:
+            log.warning("speech_scheduler_lease_release_failed")
+
+    async def _acquire_scheduler_grant(self, row) -> None:
+        if not self.scheduler.enabled:
+            return
+        state = row["state"]
+        existing = state.get("gpu_scheduler_lease")
+        if is_lease_granted(existing):
+            try:
+                refreshed = await asyncio.to_thread(
+                    self.scheduler.heartbeat,
+                    str(existing["lease_id"]),
+                    int(existing["fencing_token"]),
+                    expected_version=int(existing.get("version") or 0),
+                )
+                if is_lease_granted(refreshed):
+                    state["gpu_scheduler_lease"] = refreshed
+                    state.pop("gpu_queue", None)
+                    return
+            except Exception:
+                state.pop("gpu_scheduler_lease", None)
+
+        replicas = await asyncio.to_thread(self.gpu.replicas) if self.gpu.enabled else 1
+        slots_required = 1 if (self.gpu.enabled and self.gpu.deployment and replicas in (0, None)) else 0
+        attempt_seq = int(state.get("gpu_attempt_seq") or 0) + 1
+        state["gpu_attempt_seq"] = attempt_seq
+        attempt_id = f"att-{attempt_seq}"
+        queue_budget = self.gpu.queue_seconds if self.gpu.enabled else 1200
+        deadline = time.monotonic() + queue_budget
+
+        try:
+            decision = await asyncio.to_thread(
+                self.scheduler.acquire,
+                parent_task_id=row["task_id"],
+                attempt_id=attempt_id,
+                k8s_slots_required=slots_required,
+            )
+        except Exception as exc:
+            raise Failure("waiting_gpu_lease", 503, True) from exc
+
+        while not is_lease_granted(decision):
+            lease_id = str(decision.get("lease_id") or "")
+            lstate = str(decision.get("state") or "")
+            if not lease_id or lstate not in {"queued", "draining"}:
+                raise Failure("waiting_gpu_lease", 503, True)
+            state["gpu_scheduler_lease"] = decision
+            state["gpu_queue"] = {
+                "lease_id": lease_id,
+                "state": lstate,
+                "queue_position": decision.get("queue_position", 0),
+                "blocking_reason": decision.get("blocking_reason") or "waiting_gpu_scheduler",
+            }
+            if time.monotonic() >= deadline:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        self.scheduler.release,
+                        lease_id,
+                        int(decision.get("fencing_token") or 0),
+                        worker_settled=False,
+                        reclaim_mode="abort_unstarted",
+                        reason="queue_timeout",
+                    )
+                state.pop("gpu_scheduler_lease", None)
+                raise Failure("waiting_gpu_lease", 503, True)
+            await asyncio.sleep(1.0)
+            await asyncio.to_thread(self.store.renew, row)
+            try:
+                decision = await asyncio.to_thread(self.scheduler.get_lease, lease_id)
+            except Exception as exc:
+                raise Failure("waiting_gpu_lease", 503, True) from exc
+
+        state["gpu_scheduler_lease"] = decision
+        state.pop("gpu_queue", None)
+
     async def _ensure_gpu(self, row):
         state = row["state"]
         timings = state.setdefault("timings", {"queue_seconds": 0.0, "load_seconds": 0.0, "inference_seconds": 0.0})
-        if not self.gpu.enabled:
+        if not self.gpu.enabled and not self.scheduler.enabled:
             return
-        if not state.get("gpu_held"):
-            state["gpu_held"] = True
-            await asyncio.to_thread(self.store.checkpoint, row)
-        else:
-            await asyncio.to_thread(self.store.renew, row)
         queue_start = time.monotonic()
         try:
-            # Durable tasks, rather than per-phase memory counts, own occupancy.
-            await asyncio.to_thread(self.gpu.acquire_for_queue, track=False)
+            if self.scheduler.enabled:
+                # Canonical lock order (H7): :5056 FIRST, then non-blocking K8s Lease mirror
+                await self._acquire_scheduler_grant(row)
+                if self.gpu.enabled:
+                    if not state.get("gpu_held"):
+                        state["gpu_held"] = True
+                        await asyncio.to_thread(self.store.checkpoint, row)
+                    else:
+                        await asyncio.to_thread(self.store.renew, row)
+                    acquired_k8s = await asyncio.to_thread(self.gpu.try_acquire)
+                    if not acquired_k8s:
+                        state.pop("gpu_held", None)
+                        await self._release_scheduler_lease(row, reason="k8s_lease_contended")
+                        raise LeaseBusy(self.gpu.peer_holder())
+            elif self.gpu.enabled:
+                if not state.get("gpu_held"):
+                    state["gpu_held"] = True
+                    await asyncio.to_thread(self.store.checkpoint, row)
+                else:
+                    await asyncio.to_thread(self.store.renew, row)
+                await asyncio.to_thread(self.gpu.acquire_for_queue, track=False)
         except LeaseBusy as error:
             raise Failure("waiting_gpu_lease", 503, True) from error
         finally:
@@ -283,18 +490,43 @@ class Worker:
         prior_phase = row["phase"]
         if prior_phase == "reference":
             await asyncio.to_thread(self.store.checkpoint, row, phase="loading_model")
-        await asyncio.to_thread(self.gpu.scale_to, 1)
-        deadline = time.monotonic() + self.gpu.ready_seconds
+        if self.gpu.enabled:
+            await asyncio.to_thread(self.gpu.scale_to, 1)
+        ready_budget = self.gpu.ready_seconds if self.gpu.enabled else 900
+        deadline = time.monotonic() + ready_budget
         while time.monotonic() < deadline:
             try:
                 health = await self.peers.runtime.json(row["principal"], "GET", "/health", project_id=row["project_id"])
                 if health.get("ready") is True:
+                    if isinstance(health.get("runtime_identity"), dict):
+                        ident = health["runtime_identity"]
+                        lease = state.get("gpu_scheduler_lease")
+                        if self.scheduler.enabled and is_lease_granted(lease):
+                            need_bind = (
+                                not lease.get("pod_uid")
+                                or lease.get("pod_uid") != ident.get("pod_uid")
+                                or not (lease.get("gpu_uuids") or lease.get("assigned_gpu_uuids") or lease.get("gpu_uuid"))
+                            )
+                            if need_bind and ident.get("pod_uid"):
+                                try:
+                                    bound = await asyncio.to_thread(
+                                        self.scheduler.bind_target,
+                                        str(lease["lease_id"]),
+                                        int(lease["fencing_token"]),
+                                        runtime_identity=ident,
+                                        expected_version=int(lease.get("version") or 0),
+                                    )
+                                    state["gpu_scheduler_lease"] = bound
+                                except Exception as exc:
+                                    raise Failure("waiting_gpu_lease", 503, True) from exc
+                        state["gpu_target_identity"] = ident
                     timings["load_seconds"] = timings.get("load_seconds", 0.0) + round(max(0.0, time.monotonic() - load_start), 3)
                     if row["phase"] == "loading_model":
                         row["phase"] = "reference"
                     return
-            except Failure:
-                pass
+            except Failure as fail_err:
+                if fail_err.code == "waiting_gpu_lease":
+                    raise
             await asyncio.sleep(2)
         timings["load_seconds"] = timings.get("load_seconds", 0.0) + round(max(0.0, time.monotonic() - load_start), 3)
         raise Failure("model_load_timeout", 503, True)

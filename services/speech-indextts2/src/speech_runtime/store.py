@@ -1,5 +1,9 @@
 """Single-process durable GPU queue; scoped immutable inputs and atomic outputs."""
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+    import msvcrt
 import hashlib
 import json
 import os
@@ -11,6 +15,22 @@ from pathlib import Path
 
 from .audio import inspect_wav, digest_file
 from .domain import Failure, SHA256, UUID7, canonical, new_id, validate_create
+
+
+def _lock_file_nonblocking(handle) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+
+def _unlock_file(handle) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def now():
@@ -26,11 +46,12 @@ def atomic_write(path, data):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
-    fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    if os.name != "nt":
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 class Store:
@@ -40,9 +61,9 @@ class Store:
         if not SHA256.fullmatch(model_hash):
             raise ValueError("invalid_model_manifest_hash")
         self.model_hash = model_hash
-        self.lockfile = (self.root / "runtime.lock").open("a")
+        self.lockfile = (self.root / "runtime.lock").open("r+" if (self.root / "runtime.lock").exists() else "w+")
         try:
-            fcntl.flock(self.lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_file_nonblocking(self.lockfile)
         except OSError:
             self.lockfile.close()
             raise RuntimeError("runtime_already_active") from None
@@ -61,7 +82,7 @@ class Store:
     def close(self):
         with self.mutex:
             self.db.close()
-            fcntl.flock(self.lockfile, fcntl.LOCK_UN)
+            _unlock_file(self.lockfile)
             self.lockfile.close()
 
     @contextmanager
@@ -180,6 +201,19 @@ class Store:
     def fail(self, task_id, code):
         with self.transaction():
             self.db.execute("UPDATE tasks SET status='failed',error=?,updated=? WHERE id=? AND status='running'", (code, now(), task_id))
+
+    def active_count(self) -> int:
+        with self.mutex:
+            row = self.db.execute("SELECT count(*) FROM tasks WHERE status IN ('pending','running')").fetchone()
+            return int(row[0]) if row else 0
+
+    def abort_pending_fence(self, task_id: str) -> bool:
+        with self.transaction():
+            cur = self.db.execute(
+                "UPDATE tasks SET status='failed',error='stale_fencing_token',updated=? WHERE id=? AND status='pending'",
+                (now(), task_id),
+            )
+            return cur.rowcount > 0
 
     def recover(self):
         with self.transaction():

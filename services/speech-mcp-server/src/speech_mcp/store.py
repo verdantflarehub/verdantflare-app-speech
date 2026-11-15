@@ -243,5 +243,158 @@ class Store:
             raise TaskNotFound("task_not_found", 404)
         return {"status": "deleted", "task_id": task_id}
 
+    def upsert_pending_gpu_release(
+        self,
+        lease_id: str,
+        fencing_token: int,
+        payload: dict,
+        *,
+        owner_pod_uid: str = "",
+        claim_seconds: int = 30,
+    ) -> tuple[str, int]:
+        clean_id = str(lease_id or "").strip()
+        if not clean_id or not isinstance(payload, dict):
+            raise Failure("invalid_pending_gpu_release", 400)
+        token = new_id()
+        owner = str(owner_pod_uid or "")
+        ttl = max(1, int(claim_seconds))
+        with self.connect() as c:
+            row = c.execute(
+                """INSERT INTO speech_gpu_pending_releases(
+                    lease_id, fencing_token, payload, payload_version, status, owner_pod_uid,
+                    claim_token, claim_until, last_error, created_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, 1, 'pending', %s,
+                    %s, now() + (%s * interval '1 second'), NULL, now(), now()
+                )
+                ON CONFLICT (lease_id) DO UPDATE SET
+                    fencing_token = EXCLUDED.fencing_token,
+                    payload = EXCLUDED.payload,
+                    payload_version = speech_gpu_pending_releases.payload_version + 1,
+                    status = 'pending',
+                    owner_pod_uid = EXCLUDED.owner_pod_uid,
+                    claim_token = EXCLUDED.claim_token,
+                    claim_until = EXCLUDED.claim_until,
+                    last_error = NULL,
+                    updated_at = now()
+                WHERE speech_gpu_pending_releases.fencing_token <= EXCLUDED.fencing_token
+                  AND (
+                      speech_gpu_pending_releases.claim_until IS NULL
+                      OR speech_gpu_pending_releases.claim_until <= now()
+                      OR (%s <> '' AND speech_gpu_pending_releases.owner_pod_uid = %s)
+                  )
+                RETURNING claim_token, payload_version""",
+                (clean_id, int(fencing_token), Jsonb(payload), owner, token, ttl, owner, owner),
+            ).fetchone()
+        if not row:
+            raise Failure("pending_gpu_release_claimed_or_stale", 409, True)
+        return str(row["claim_token"]), int(row["payload_version"])
+
+    def claim_next_pending_gpu_release(
+        self,
+        *,
+        owner_pod_uid: str = "",
+        include_quarantined: bool = False,
+        claim_seconds: int = 30,
+        exclude_lease_ids: tuple[str, ...] | list[str] = (),
+    ) -> dict | None:
+        statuses = ("pending", "quarantined_400") if include_quarantined else ("pending",)
+        excluded = [str(x) for x in exclude_lease_ids if str(x)]
+        token = new_id()
+        with self.connect() as c:
+            return c.execute(
+                """WITH candidate AS (
+                    SELECT lease_id FROM speech_gpu_pending_releases
+                    WHERE status = ANY(%s)
+                      AND (claim_until IS NULL OR claim_until <= now())
+                      AND NOT (lease_id = ANY(%s))
+                    ORDER BY updated_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE speech_gpu_pending_releases r
+                SET owner_pod_uid = %s,
+                    claim_token = %s,
+                    claim_until = now() + (%s * interval '1 second'),
+                    updated_at = now()
+                FROM candidate
+                WHERE r.lease_id = candidate.lease_id
+                RETURNING r.*""",
+                (list(statuses), excluded, str(owner_pod_uid or ""), token, max(1, int(claim_seconds))),
+            ).fetchone()
+
+    def quarantine_pending_gpu_release(
+        self,
+        lease_id: str,
+        last_error: str,
+        *,
+        claim_token: str,
+        payload_version: int,
+    ) -> bool:
+        if not claim_token or int(payload_version) <= 0:
+            return False
+        with self.connect() as c:
+            n = c.execute(
+                """UPDATE speech_gpu_pending_releases
+                   SET status = 'quarantined_400',
+                       last_error = %s,
+                       claim_token = NULL,
+                       claim_until = NULL,
+                       updated_at = now()
+                   WHERE lease_id = %s
+                     AND claim_token = %s
+                     AND payload_version = %s""",
+                (str(last_error or "")[:2000], str(lease_id), str(claim_token), int(payload_version)),
+            ).rowcount
+        return n == 1
+
+    def release_pending_gpu_claim(
+        self,
+        lease_id: str,
+        *,
+        claim_token: str,
+        payload_version: int,
+    ) -> bool:
+        if not claim_token or int(payload_version) <= 0:
+            return False
+        with self.connect() as c:
+            n = c.execute(
+                """UPDATE speech_gpu_pending_releases
+                   SET claim_token = NULL,
+                       claim_until = NULL,
+                       updated_at = now()
+                   WHERE lease_id = %s
+                     AND claim_token = %s
+                     AND payload_version = %s""",
+                (str(lease_id), str(claim_token), int(payload_version)),
+            ).rowcount
+        return n == 1
+
+    def delete_pending_gpu_release(
+        self,
+        lease_id: str,
+        *,
+        claim_token: str,
+        payload_version: int,
+    ) -> bool:
+        if not claim_token or int(payload_version) <= 0:
+            return False
+        with self.connect() as c:
+            n = c.execute(
+                """DELETE FROM speech_gpu_pending_releases
+                   WHERE lease_id = %s
+                     AND claim_token = %s
+                     AND payload_version = %s""",
+                (str(lease_id), str(claim_token), int(payload_version)),
+            ).rowcount
+        return n == 1
+
+    def get_pending_gpu_release(self, lease_id: str) -> dict | None:
+        with self.connect() as c:
+            return c.execute(
+                "SELECT * FROM speech_gpu_pending_releases WHERE lease_id = %s",
+                (str(lease_id),),
+            ).fetchone()
+
 
 TaskStore = Store
