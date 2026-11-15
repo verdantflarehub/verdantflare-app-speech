@@ -392,11 +392,13 @@ class Worker:
         existing = state.get("gpu_scheduler_lease")
         if is_lease_granted(existing):
             try:
+                # Receiver verification and background renewal also advance version.
+                # Heartbeat already fences by token; a stale cached CAS version must
+                # not cause a second reservation for the same running task.
                 refreshed = await asyncio.to_thread(
                     self.scheduler.heartbeat,
                     str(existing["lease_id"]),
                     int(existing["fencing_token"]),
-                    expected_version=int(existing.get("version") or 0),
                 )
                 if is_lease_granted(refreshed):
                     state["gpu_scheduler_lease"] = refreshed

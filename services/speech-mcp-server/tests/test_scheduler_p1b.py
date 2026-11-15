@@ -19,6 +19,40 @@ from test_speech import MemoryStore, fixture
 
 
 class SpeechSchedulerP1bTest(unittest.IsolatedAsyncioTestCase):
+    async def test_receiver_version_advance_keeps_original_lease(self) -> None:
+        _, _, row = fixture()
+        row["state"]["gpu_scheduler_lease"] = {
+            "lease_id": "lease-original", "fencing_token": 77,
+            "state": "leased", "version": 1,
+        }
+        calls = []
+
+        def handler(request):
+            body = json.loads(request.content)
+            calls.append(request.url.path)
+            if request.url.path.endswith("/heartbeat"):
+                # Receiver verify has already advanced the server row to version 2.
+                if body.get("expected_version", 2) != 2:
+                    return httpx.Response(409, json={"error": {"code": "VERSION_CONFLICT"}})
+                self.assertEqual(body["fencing_token"], 77)
+                return httpx.Response(200, json={
+                    "lease_id": "lease-original", "fencing_token": 77,
+                    "state": "running", "version": 3,
+                })
+            raise AssertionError("Must retain original lease, not acquire another")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        self.addCleanup(client.close)
+        scheduler = SchedulerLeaseClient(base_url="http://station-runtime:5056",
+                                         token="test-token", enabled=True, client=client)
+        with patch("speech_mcp.worker.threading.Thread.start"):
+            worker = Worker(SimpleNamespace(store=MemoryStore(row), peers=SimpleNamespace(),
+                                            gpu=SimpleNamespace(enabled=False), scheduler=scheduler))
+        await worker._acquire_scheduler_grant(row)
+        self.assertEqual(calls, ["/internal/v1/gpu-scheduler/leases/lease-original/heartbeat"])
+        self.assertEqual(row["state"]["gpu_scheduler_lease"]["version"], 3)
+        self.assertNotIn("gpu_attempt_seq", row["state"])
+
     async def test_ensure_gpu_acquires_slot_binds_target_and_releases_with_receiver_proof(self) -> None:
         _, _, row = fixture()
         row = copy.deepcopy(row)
