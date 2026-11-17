@@ -155,7 +155,11 @@ class Store:
             return c.execute("""WITH candidate AS (
                 SELECT task_id FROM speech_tasks WHERE status IN ('pending','running')
                 AND next_attempt<=now() AND (lease_until IS NULL OR lease_until<now())
-                ORDER BY CASE WHEN phase IN ('inference','archive','complete') THEN 0 ELSE 1 END,
+                ORDER BY CASE
+                             WHEN phase IN ('inference','archive','complete') THEN 0
+                             WHEN phase = 'submit' OR (state->'gpu_scheduler_lease'->>'state') IN ('leased','running','granted') THEN 1
+                             ELSE 2
+                         END,
                          next_attempt,created_at FOR UPDATE SKIP LOCKED LIMIT 1)
                 UPDATE speech_tasks t SET status='running',lease_token=%s,
                 lease_until=now()+interval '120 seconds',updated_at=now()

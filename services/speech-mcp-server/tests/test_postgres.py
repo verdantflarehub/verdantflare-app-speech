@@ -28,15 +28,20 @@ class PostgresTests(unittest.TestCase):
             principal = {k: new_id() for k in ("organization_id", "subject_id", "request_id")}
             request = {"project_id": new_id(), "text": "test"}
             queued = store.create(principal, request | {"idempotency_key": "queued"}, {})
+            submit_ready = store.create(principal, request | {"idempotency_key": "submit-ready"}, {})
             result = store.create(principal, request | {"idempotency_key": "result"}, {})
             with store.connect() as c:
                 c.execute("UPDATE speech_tasks SET phase='inference' WHERE task_id=%s", (result["task_id"],))
+                c.execute("UPDATE speech_tasks SET phase='submit',next_attempt=now()-interval '1 minute' WHERE task_id=%s", (submit_ready["task_id"],))
                 c.execute("UPDATE speech_tasks SET phase='reference',next_attempt=now()-interval '1 hour' WHERE task_id=%s", (queued["task_id"],))
             first = store.claim()
             self.assertEqual(first["task_id"], result["task_id"])
-            # Priority cannot steal an active lease; the other worker gets queued work.
-            second = store.claim()
-            self.assertEqual(second["task_id"], queued["task_id"])
+            # Submit (already holding GPU lease) precedes older unleased reference tasks!
+            second_submit = store.claim()
+            self.assertEqual(second_submit["task_id"], submit_ready["task_id"])
+            # Priority cannot steal an active lease; the next worker gets queued reference work.
+            third = store.claim()
+            self.assertEqual(third["task_id"], queued["task_id"])
             store.save(first, status="running", phase="inference", delay=60)
             self.assertIsNone(store.claim())  # Future retry is still respected.
         finally:
@@ -273,7 +278,7 @@ class PostgresTests(unittest.TestCase):
                 710,
                 {"idempotency_key": "rel:lease-r4-fence:710:bad", "fencing_token": 710, "worker_settled": False},
                 owner_pod_uid="pod-uid-old",
-                claim_seconds=1,
+                claim_seconds=3,
             )
             self.assertEqual(ver_a, 1)
             # While Pod A's claim is still active, a foreign Pod B cannot overwrite it prematurely
@@ -285,7 +290,7 @@ class PostgresTests(unittest.TestCase):
                     owner_pod_uid="pod-uid-new",
                     claim_seconds=5,
                 )
-            time.sleep(1.15)
+            time.sleep(3.2)
             # After Pod A's claim expired, Pod B updates the row with corrected payload (payload_version -> 2)
             tok_b, ver_b = store.upsert_pending_gpu_release(
                 "lease-r4-fence",

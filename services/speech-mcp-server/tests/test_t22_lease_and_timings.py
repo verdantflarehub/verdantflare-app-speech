@@ -24,7 +24,7 @@ from test_speech import MemoryStore, fixture
 
 class SpeechT22LeaseAndTimingsTest(unittest.IsolatedAsyncioTestCase):
     async def test_scheduler_enabled_disables_legacy_k8s_lease_and_warns_once(self) -> None:
-        self.assertEqual(__version__, "0.2.11")
+        self.assertEqual(__version__, "0.2.12")
         env = {
             "STATION_GPU_SCHEDULER_URL": "http://station-runtime:5056",
             "STATION_GPU_SCHEDULER_TOKEN": "s" * 36,
@@ -67,7 +67,7 @@ class SpeechT22LeaseAndTimingsTest(unittest.IsolatedAsyncioTestCase):
         # Cold-start speech.create succeeds when scaled to 0 without touching runtime or K8s Leases
         created = await svc.call("speech.create", req, p)
         self.assertEqual(created["status"], "pending")
-        self.assertEqual(created["service_version"], "0.2.11")
+        self.assertEqual(created["service_version"], "0.2.12")
         rt_info = await svc.engine_runtime_info(p)
         self.assertEqual(rt_info["reason"], "scaled_to_zero")
         self.assertTrue(rt_info["layers"]["orchestration_alive"])
@@ -755,6 +755,137 @@ class SpeechT22LeaseAndTimingsTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(Failure, "output_integrity_failed"):
             await worker.step(row_tamper)
         self.assertNotIn("generation", row_tamper["state"])
+
+    async def test_reclaiming_startup_lease_settled_and_queued_yield_reuses_same_lease(self) -> None:
+        _, _, row_reclaim = fixture()
+        row_reclaim["status"] = "running"
+        row_reclaim["phase"] = "submit"
+        row_reclaim["lease_token"] = None
+        row_reclaim["state"]["gpu_scheduler_lease"] = {
+            "lease_id": "lease-reclaim-1",
+            "state": "leased",
+            "fencing_token": 77,
+            "version": 3,
+            "pod_uid": "pod-u1",
+            "container_id": "cid-1",
+            "boot_id": "boot-1",
+        }
+        _, _, row_other = fixture()
+        row_other["task_id"] = new_id()
+        row_other["status"] = "running"
+        row_other["phase"] = "reference"
+
+        store = MemoryStore(row_reclaim)
+        store.rows[row_other["task_id"]] = row_other
+
+        released_modes: dict[str, str] = {}
+
+        def fake_release(lid, tok, **kwargs):
+            released_modes[lid] = kwargs.get("reclaim_mode") or ""
+            return {"lease_id": lid, "state": "released"}
+
+        acquire_calls = []
+        q_get_calls = []
+
+        def fake_acquire(**kwargs):
+            acquire_calls.append(kwargs)
+            return {"lease_id": "lease-q-reuse", "state": "queued", "fencing_token": 88, "queue_position": 1}
+
+        def fake_get_lease(lid):
+            if lid == "lease-reclaim-1":
+                return {
+                    "lease_id": "lease-reclaim-1",
+                    "state": "reclaiming",
+                    "fencing_token": 77,
+                    "version": 4,
+                    "pod_uid": "pod-u1",
+                    "container_id": "cid-1",
+                    "boot_id": "boot-1",
+                }
+            q_get_calls.append(lid)
+            if len(q_get_calls) < 1:
+                return {"lease_id": "lease-q-reuse", "state": "queued", "fencing_token": 88, "queue_position": 1}
+            return {
+                "lease_id": "lease-q-reuse",
+                "state": "leased",
+                "fencing_token": 88,
+                "version": 2,
+                "gpu_uuids": ["GPU-0000"],
+                "pod_uid": "pod-u1",
+                "container_id": "cid-1",
+                "boot_id": "boot-1",
+            }
+
+        sched = SimpleNamespace(
+            enabled=True,
+            flush_pending_releases=lambda **_: 0,
+            list_own_leases=lambda: [],
+            get_lease=fake_get_lease,
+            heartbeat=lambda lid, tok: {"lease_id": lid, "state": "running", "fencing_token": tok},
+            acquire=fake_acquire,
+            release=fake_release,
+        )
+        runtime = SimpleNamespace(
+            request_status_json=AsyncMock(
+                side_effect=lambda method, path, *args, **kwargs: (
+                    (
+                        200,
+                        {
+                            "active_tasks": 0,
+                            "runtime_identity": {"pod_uid": "pod-u1", "container_id": "cid-1", "boot_id": "boot-1"},
+                        },
+                    )
+                    if path == "/health"
+                    else (
+                        200,
+                        {
+                            "reclaim_proof": {
+                                "proof_source": "receiver_guard",
+                                "token_sealed": True,
+                                "reclaimed": True,
+                                "active_tasks": 0,
+                                "revoked_lease_id": "lease-reclaim-1",
+                                "resident_procs": [{"pid": 100, "starttime_ticks": 200}],
+                            }
+                        },
+                    )
+                )
+            )
+        )
+        gpu = SimpleNamespace(
+            enabled=False,
+            scale_enabled=True,
+            queue_seconds=60,
+            replicas_for=lambda: 1,
+            deployment_pods=lambda: ["speech-indextts2-abc"],
+        )
+        with patch("threading.Thread"):
+            w = Worker(
+                SimpleNamespace(
+                    store=store,
+                    peers=SimpleNamespace(open=AsyncMock(), runtime=runtime),
+                    gpu=gpu,
+                    scheduler=sched,
+                )
+            )
+        w._queue_step_yield_seconds = 0.0
+        summary = await w.reconcile_startup_leases()
+        self.assertEqual(summary["adopted"], [])
+        self.assertEqual(summary["released"], ["lease-reclaim-1"])
+        self.assertEqual(released_modes["lease-reclaim-1"], "warm_idle_settled")
+        self.assertNotIn("gpu_scheduler_lease", row_reclaim["state"])
+
+        # Step yield preserves queued lease_id and resumes polling without minting a second acquire attempt!
+        row_other["lease_token"] = "tok-1"
+        with self.assertRaisesRegex(Failure, "waiting_gpu_lease"):
+            await w._acquire_scheduler_grant(row_other)
+        self.assertEqual(len(acquire_calls), 1)
+        self.assertEqual(row_other["state"]["gpu_scheduler_lease"]["lease_id"], "lease-q-reuse")
+
+        w._queue_step_yield_seconds = 5.0
+        await w._acquire_scheduler_grant(row_other)
+        self.assertEqual(len(acquire_calls), 1)
+        self.assertEqual(row_other["state"]["gpu_scheduler_lease"]["state"], "leased")
 
 
 if __name__ == "__main__":

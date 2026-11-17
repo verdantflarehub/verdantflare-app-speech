@@ -257,14 +257,37 @@ class Worker:
                         live = lease
                 lstate = str((live or {}).get("state") or "").strip().lower()
                 if lstate in {"released", "expired"}:
+                    await self._clear_terminal_task_lease(str(row.get("task_id") or ""), lid)
+                    continue
+                if lstate in {"reclaiming", "reconciling", "quarantined"}:
+                    orphan_entries[lid] = {
+                        "lease": dict(live or lease),
+                        "target_identity": state.get("gpu_target_identity") if isinstance(state.get("gpu_target_identity"), dict) else {},
+                        "reclaim_proof": state.get("gpu_reclaim_proof") if isinstance(state.get("gpu_reclaim_proof"), dict) else None,
+                        "runtime_task_id": str(state.get("runtime_task_id") or ""),
+                        "task_id": str(row.get("task_id") or ""),
+                        "principal": row.get("principal") if isinstance(row.get("principal"), dict) else None,
+                        "project_id": row.get("project_id"),
+                    }
                     continue
                 if is_lease_granted(live) and hasattr(self.scheduler, "heartbeat"):
-                    with contextlib.suppress(Exception):
+                    try:
                         await asyncio.to_thread(
                             self.scheduler.heartbeat,
                             lid,
                             int((live or lease).get("fencing_token") or 0),
                         )
+                    except Exception:
+                        orphan_entries[lid] = {
+                            "lease": dict(live or lease),
+                            "target_identity": state.get("gpu_target_identity") if isinstance(state.get("gpu_target_identity"), dict) else {},
+                            "reclaim_proof": state.get("gpu_reclaim_proof") if isinstance(state.get("gpu_reclaim_proof"), dict) else None,
+                            "runtime_task_id": str(state.get("runtime_task_id") or ""),
+                            "task_id": str(row.get("task_id") or ""),
+                            "principal": row.get("principal") if isinstance(row.get("principal"), dict) else None,
+                            "project_id": row.get("project_id"),
+                        }
+                        continue
                 adopted_ids.add(lid)
                 adopted.append(lid)
                 log.info(
@@ -296,7 +319,7 @@ class Worker:
                 },
                 "reclaim_proof": None,
                 "runtime_task_id": "",
-                "task_id": str(rlease.get("task_id") or ""),
+                "task_id": str(rlease.get("task_id") or rlease.get("holder_task_id") or ""),
                 "principal": None,
                 "project_id": None,
             }
@@ -421,7 +444,7 @@ class Worker:
         rows = getattr(self.store, "rows", None)
         if isinstance(rows, dict):
             row = rows.get(task_id)
-            if isinstance(row, dict) and row.get("status") in {"succeeded", "failed"}:
+            if isinstance(row, dict) and (row.get("status") in {"succeeded", "failed"} or not row.get("lease_token")):
                 st = row.get("state")
                 if isinstance(st, dict):
                     cur = st.get("gpu_scheduler_lease")
@@ -1278,40 +1301,86 @@ class Worker:
                 if is_lease_granted(refreshed):
                     state["gpu_scheduler_lease"] = refreshed
                     state.pop("gpu_queue", None)
+                    state.pop("gpu_queue_started_at", None)
                     return
             except Exception:
-                state.pop("gpu_scheduler_lease", None)
+                await self._release_scheduler_lease(row, reason="stale_granted_lease_before_step")
 
-        replicas = await asyncio.to_thread(self.gpu.replicas_for) if self._scale_enabled() else 1
-        slots_required = 1 if (self._scale_enabled() and replicas in (0, None)) else 0
-        pre_ident: dict | None = None
-        if slots_required == 0:
-            with contextlib.suppress(Exception):
-                health = await self._probe_runtime_health(p=row["principal"], project_id=row["project_id"])
-                if isinstance(health, dict) and _has_concrete_identity(health.get("runtime_identity")):
-                    pre_ident = dict(health["runtime_identity"])
-                    state["gpu_target_identity"] = pre_ident
-        attempt_seq = int(state.get("gpu_attempt_seq") or 0) + 1
-        state["gpu_attempt_seq"] = attempt_seq
-        attempt_id = f"att-{attempt_seq}"
         queue_budget = int(getattr(self.gpu, "queue_seconds", 1200) or 1200)
-        deadline = time.monotonic() + queue_budget
+        step_yield_seconds = float(getattr(self, "_queue_step_yield_seconds", 8.0))
+        decision: dict | None = None
+        existing = state.get("gpu_scheduler_lease")
+        if isinstance(existing, dict) and str(existing.get("lease_id") or "").strip():
+            ex_id = str(existing["lease_id"]).strip()
+            ex_state = str(existing.get("state") or "").strip().lower()
+            if ex_state in {"queued", "draining"} and hasattr(self.scheduler, "get_lease"):
+                try:
+                    polled = await asyncio.to_thread(self.scheduler.get_lease, ex_id)
+                    p_state = str((polled or {}).get("state") or "").strip().lower()
+                    if is_lease_granted(polled) or p_state in {"queued", "draining"}:
+                        decision = polled
+                    else:
+                        state.pop("gpu_scheduler_lease", None)
+                        state.pop("gpu_queue", None)
+                        state.pop("gpu_queue_started_at", None)
+                except SchedulerError as exc:
+                    if exc.status_code == 404:
+                        state.pop("gpu_scheduler_lease", None)
+                        state.pop("gpu_queue", None)
+                        state.pop("gpu_queue_started_at", None)
+                    else:
+                        raise Failure("waiting_gpu_lease", 503, True) from exc
+                except Exception as exc:
+                    raise Failure("waiting_gpu_lease", 503, True) from exc
+            elif ex_state in {"reclaiming", "reconciling", "quarantined"}:
+                await self._release_scheduler_lease(row, reason="stale_reclaiming_lease_before_step")
+            else:
+                state.pop("gpu_scheduler_lease", None)
+                state.pop("gpu_queue", None)
+                state.pop("gpu_queue_started_at", None)
 
-        try:
-            decision = await asyncio.to_thread(
-                self.scheduler.acquire,
-                parent_task_id=row["task_id"],
-                attempt_id=attempt_id,
-                k8s_slots_required=slots_required,
-                runtime_identity=pre_ident,
-            )
-        except Exception as exc:
-            raise Failure("waiting_gpu_lease", 503, True) from exc
+        if decision is None:
+            replicas = await asyncio.to_thread(self.gpu.replicas_for) if self._scale_enabled() else 1
+            slots_required = 1 if (self._scale_enabled() and replicas in (0, None)) else 0
+            pre_ident: dict | None = None
+            if slots_required == 0:
+                with contextlib.suppress(Exception):
+                    health = await self._probe_runtime_health(p=row["principal"], project_id=row["project_id"])
+                    if isinstance(health, dict) and _has_concrete_identity(health.get("runtime_identity")):
+                        pre_ident = dict(health["runtime_identity"])
+                        state["gpu_target_identity"] = pre_ident
+            attempt_seq = int(state.get("gpu_attempt_seq") or 0) + 1
+            state["gpu_attempt_seq"] = attempt_seq
+            attempt_id = f"att-{attempt_seq}"
+            state["gpu_queue_started_at"] = time.time()
+
+            try:
+                decision = await asyncio.to_thread(
+                    self.scheduler.acquire,
+                    parent_task_id=row["task_id"],
+                    attempt_id=attempt_id,
+                    k8s_slots_required=slots_required,
+                    runtime_identity=pre_ident,
+                )
+            except Exception as exc:
+                raise Failure("waiting_gpu_lease", 503, True) from exc
+
+        now_wall = time.time()
+        q_started = _finite_float(state.get("gpu_queue_started_at"))
+        if q_started is None or q_started <= 0:
+            q_started = now_wall
+            state["gpu_queue_started_at"] = q_started
+        remaining_total = max(0.0, float(queue_budget) - max(0.0, now_wall - q_started))
+        deadline = time.monotonic() + remaining_total
+        step_deadline = time.monotonic() + min(remaining_total, step_yield_seconds)
 
         while not is_lease_granted(decision):
             lease_id = str(decision.get("lease_id") or "")
             lstate = str(decision.get("state") or "")
             if not lease_id or lstate not in {"queued", "draining"}:
+                state.pop("gpu_scheduler_lease", None)
+                state.pop("gpu_queue", None)
+                state.pop("gpu_queue_started_at", None)
                 raise Failure("waiting_gpu_lease", 503, True)
             state["gpu_scheduler_lease"] = decision
             state["gpu_queue"] = {
@@ -1320,7 +1389,8 @@ class Worker:
                 "queue_position": decision.get("queue_position", 0),
                 "blocking_reason": decision.get("blocking_reason") or "waiting_gpu_scheduler",
             }
-            if time.monotonic() >= deadline:
+            now_mono = time.monotonic()
+            if now_mono >= deadline:
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(
                         self.scheduler.release,
@@ -1331,6 +1401,9 @@ class Worker:
                         reason="queue_timeout",
                     )
                 state.pop("gpu_scheduler_lease", None)
+                state.pop("gpu_queue_started_at", None)
+                raise Failure("waiting_gpu_lease", 503, True)
+            if now_mono >= step_deadline:
                 raise Failure("waiting_gpu_lease", 503, True)
             await asyncio.sleep(1.0)
             await asyncio.to_thread(self.store.renew, row)
@@ -1341,6 +1414,7 @@ class Worker:
 
         state["gpu_scheduler_lease"] = decision
         state.pop("gpu_queue", None)
+        state.pop("gpu_queue_started_at", None)
         with contextlib.suppress(Exception):
             await asyncio.to_thread(self.store.checkpoint, row)
 
