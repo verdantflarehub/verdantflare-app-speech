@@ -78,7 +78,7 @@ class SpeechSchedulerP1bTest(unittest.IsolatedAsyncioTestCase):
             if request.url.path.endswith("/acquire"):
                 # Verify deployment has NOT been scaled to 1 before :5056 acquire AND K8s lease NOT yet acquired!
                 self.assertEqual(api.get_scale("speech-indextts2"), 0)
-                self.assertIsNone(api.get_lease("gpu-task-indextts2"))
+                self.assertEqual(api.leases, {})
                 return httpx.Response(
                     200,
                     json={
@@ -193,14 +193,18 @@ class SpeechSchedulerP1bTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hdrs["X-VF-GPU-Pod-UID"], "pod-indextts2-1")
         self.assertEqual(hdrs["X-VF-GPU-Boot-ID"], "boot-node-1")
 
-        # Inference failure with receiver_guard reclaim_proof releases :5056 lease as warm_idle_settled
+        # Inference failure with sealed receiver_guard reclaim_proof and zero remaining tasks
+        # scales speech-indextts2 to 0, waits for Pod exit, and releases :5056 with worker_settled=True
         row["phase"] = "inference"
         with self.assertRaises(Exception):
             await worker.step(row)
+        self.assertEqual(api.get_scale("speech-indextts2"), 0)
+        self.assertEqual(api.deployment_pods("speech-indextts2"), [])
+        self.assertEqual(api.lease_calls, [])
         rel = [c for c in sched_calls if c[1] == "/internal/v1/gpu-scheduler/leases/lease-speech-99/release"]
         self.assertEqual(len(rel), 1)
         self.assertTrue(rel[0][2]["worker_settled"])
-        self.assertEqual(rel[0][2]["reclaim_mode"], "warm_idle_settled")
+        self.assertNotIn("reclaim_mode", rel[0][2])
         self.assertEqual(rel[0][2]["pod_uid"], "pod-indextts2-1")
 
     async def test_k8s_lease_contention_rolls_back_scheduler_with_abort_unstarted_and_missing_proof_never_fakes_settled(self) -> None:
@@ -209,7 +213,7 @@ class SpeechSchedulerP1bTest(unittest.IsolatedAsyncioTestCase):
         store = MemoryStore(row)
         api = MemoryApi()
         now_dt = datetime(2026, 11, 15, tzinfo=timezone.utc)
-        # Pre-hold conflicting music3 K8s Lease
+        # Pre-hold legacy music3 K8s Lease; with :5056 enabled (D1-A), legacy K8s Leases are retired and never queried
         api.replace_lease(
             "gpu-task-music3",
             {
@@ -220,12 +224,14 @@ class SpeechSchedulerP1bTest(unittest.IsolatedAsyncioTestCase):
             },
             None,
         )
+        api.lease_calls.clear()
         gpu = GpuCoordinator(
             api,
             "indextts2",
             "speech/test",
             deployment="speech-indextts2",
             enabled=True,
+            ready_seconds=0.01,
             now=lambda: now_dt + timedelta(seconds=5),
         )
 
@@ -270,14 +276,25 @@ class SpeechSchedulerP1bTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(Failure) as ctx:
             await worker._ensure_gpu(row)
-        self.assertEqual(ctx.exception.code, "waiting_gpu_lease")
+        self.assertEqual(ctx.exception.code, "model_load_timeout")
+        self.assertEqual(api.lease_calls, [])
+        self.assertEqual(api.get_scale("speech-indextts2"), 0)
         rel = [c for c in sched_calls if c[1].endswith("/release")]
         self.assertEqual(len(rel), 1)
         self.assertEqual(rel[0][2]["reclaim_mode"], "abort_unstarted")
         self.assertFalse(rel[0][2]["worker_settled"])
 
-        # Now test bound lease with unreachable receiver reclaim endpoint -> MUST send worker_settled=False, reclaim_mode=""
+        # Unmanaged bound lease with unreachable receiver reclaim endpoint -> MUST send worker_settled=False, reclaim_mode=""
         sched_calls.clear()
+        with patch("speech_mcp.worker.threading.Thread.start"):
+            unmanaged_worker = Worker(
+                SimpleNamespace(
+                    store=store,
+                    peers=peers,
+                    gpu=SimpleNamespace(enabled=False),
+                    scheduler=scheduler,
+                )
+            )
         row["state"]["gpu_scheduler_lease"] = {
             "lease_id": "lease-speech-bound",
             "fencing_token": 89,
@@ -286,7 +303,7 @@ class SpeechSchedulerP1bTest(unittest.IsolatedAsyncioTestCase):
             "pod_uid": "pod-indextts2-1",
         }
         row["state"]["gpu_target_identity"] = {"pod_uid": "pod-indextts2-1"}
-        await worker._release_scheduler_lease(row, reason="timeout_no_proof")
+        await unmanaged_worker._release_scheduler_lease(row, reason="timeout_no_proof")
         rel2 = [c for c in sched_calls if c[1].endswith("/release")]
         self.assertEqual(len(rel2), 1)
         self.assertFalse(rel2[0][2]["worker_settled"])

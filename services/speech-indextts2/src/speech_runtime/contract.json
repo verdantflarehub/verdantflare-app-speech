@@ -17,6 +17,12 @@
     },
     {
       "$ref": "#/$defs/audio_report"
+    },
+    {
+      "$ref": "#/$defs/editing_audio_report"
+    },
+    {
+      "$ref": "#/$defs/task_report"
     }
   ],
   "$defs": {
@@ -481,6 +487,153 @@
         "peak_dbfs",
         "clipped_samples",
         "quiet_sample_fraction"
+      ]
+    },
+    "editing_audio_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sample_rate_hz": {
+          "const": 48000
+        },
+        "channels": {
+          "const": 1
+        },
+        "bit_depth": {
+          "const": 24
+        },
+        "duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 180
+        },
+        "peak_dbfs": {
+          "type": "number",
+          "maximum": 0
+        },
+        "clipped_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quiet_sample_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "true_peak_dbtp": {
+          "type": "number",
+          "maximum": -1.0
+        },
+        "integrated_lufs": {
+          "type": "number",
+          "minimum": -70
+        },
+        "leading_silence_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "trailing_silence_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "applied_gain_db": {
+          "type": "number",
+          "maximum": 12
+        },
+        "limited_by": {
+          "enum": [
+            "none",
+            "true_peak",
+            "max_boost",
+            "silence"
+          ]
+        }
+      },
+      "required": [
+        "sha256",
+        "size",
+        "sample_rate_hz",
+        "channels",
+        "bit_depth",
+        "duration_seconds",
+        "peak_dbfs",
+        "clipped_samples",
+        "quiet_sample_fraction",
+        "true_peak_dbtp",
+        "integrated_lufs",
+        "applied_gain_db",
+        "limited_by"
+      ]
+    },
+    "task_report": {
+      "type": "object",
+      "additionalProperties": true,
+      "not": {
+        "required": [
+          "status"
+        ]
+      },
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "model_manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "input_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "reference_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "original": {
+          "$ref": "#/$defs/audio_report"
+        },
+        "editing": {
+          "$ref": "#/$defs/editing_audio_report"
+        },
+        "conversion": {
+          "const": "resample_to_48000_pcm_s24le_mono"
+        },
+        "elapsed_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "editing_gain_db": {
+          "type": "number",
+          "maximum": 12
+        },
+        "transcript_check": {
+          "type": "object"
+        },
+        "warnings": {
+          "type": "array"
+        }
+      },
+      "required": [
+        "task_id",
+        "model_manifest_sha256",
+        "input_sha256",
+        "reference_sha256",
+        "original",
+        "editing",
+        "conversion",
+        "elapsed_seconds",
+        "editing_gain_db",
+        "transcript_check",
+        "warnings"
       ]
     }
   }

@@ -3,13 +3,20 @@ import functools
 import hashlib
 import io
 import math
+import os
 import subprocess
 from pathlib import Path
 
 from .domain import Failure
 
 MAX_REFERENCE_BYTES = 2 * 1024 * 1024
+MAX_EDITING_BYTES = 32 * 1024 * 1024
+TARGET_EDITING_LUFS = -16.0
 TRUE_PEAK_CEILING_DBTP = -1.0
+TRUE_PEAK_INITIAL_MARGIN_DB = 0.1
+MAX_EDITING_BOOST_DB = 12.0
+SILENCE_FLOOR_LUFS = -60.0
+EDITING_LIMITED_BY_VALUES = ("none", "true_peak", "max_boost", "silence")
 
 
 def pcm16_with_headroom(samples):
@@ -170,6 +177,101 @@ def quality_warnings(native, duration_difference=None, transcript_check=None):
     if duration_difference is not None and duration_difference > 0:
         warnings.append({"code": "window_overrun", "level": "warning"})
     return warnings
+
+
+def compute_editing_gain(l_in: float, tp_in: float) -> tuple[float, str]:
+    """Plan A pure linear utterance gain toward -16.0 LUFS under -1.0 dBTP true-peak priority."""
+    if not (math.isfinite(l_in) and math.isfinite(tp_in)):
+        raise Failure("invalid_engine_waveform", 500)
+    if l_in <= SILENCE_FLOOR_LUFS:
+        return 0.0, "silence"
+    target_gain = TARGET_EDITING_LUFS - l_in
+    peak_cap = TRUE_PEAK_CEILING_DBTP - tp_in - TRUE_PEAK_INITIAL_MARGIN_DB
+    boost_cap = MAX_EDITING_BOOST_DB
+    if target_gain <= peak_cap and target_gain <= boost_cap:
+        return target_gain, "none"
+    if peak_cap <= boost_cap:
+        return peak_cap, "true_peak"
+    return boost_cap, "max_boost"
+
+
+def normalize_editing_wav_bytes(data: bytes, *, true_peak_fn=true_peak_dbtp) -> tuple[bytes, dict]:
+    """Apply pure linear utterance gain to 48 kHz / PCM24 / mono WAV bytes with 4x true-peak verification."""
+    import numpy as np
+    import soundfile as sf
+
+    if len(data) > MAX_EDITING_BYTES:
+        raise Failure("output_too_large", 500)
+    try:
+        with sf.SoundFile(io.BytesIO(data)) as wav:
+            rate, channels, frames, fmt, subtype = wav.samplerate, wav.channels, wav.frames, wav.format, wav.subtype
+            if fmt not in ("WAV", "WAVEX") or subtype != "PCM_24" or channels != 1 or rate != 48000 or frames <= 0:
+                raise Failure("invalid_editing_format", 500)
+            samples = wav.read(frames, dtype="float64")
+            if len(samples) != frames or not np.isfinite(samples).all():
+                raise Failure("truncated_audio")
+    except (sf.LibsndfileError, ValueError):
+        raise Failure("invalid_wav") from None
+
+    if float(np.abs(samples).max()) == 0.0:
+        raise Failure("silent_audio")
+
+    l_in = integrated_lufs(samples, rate)
+    tp_in = true_peak_fn(samples)
+    gain_db, limited_by = compute_editing_gain(l_in, tp_in)
+
+    def _quantize_pcm24(g_db: float) -> tuple[bytes, np.ndarray]:
+        scaled = samples * (10.0 ** (g_db / 20.0))
+        if not np.isfinite(scaled).all():
+            raise Failure("invalid_engine_waveform", 500)
+        buf = io.BytesIO()
+        sf.write(buf, scaled, rate, format="WAV", subtype="PCM_24")
+        raw = buf.getvalue()
+        with sf.SoundFile(io.BytesIO(raw)) as qwav:
+            qsamples = qwav.read(qwav.frames, dtype="float32")
+        return raw, qsamples
+
+    if gain_db == 0.0:
+        out_bytes = data
+        with sf.SoundFile(io.BytesIO(out_bytes)) as qwav:
+            quantized_samples = qwav.read(qwav.frames, dtype="float32")
+    else:
+        out_bytes, quantized_samples = _quantize_pcm24(gain_db)
+
+    measured_tp = true_peak_fn(quantized_samples)
+    for _ in range(16):
+        if measured_tp <= TRUE_PEAK_CEILING_DBTP:
+            break
+        gain_db -= (measured_tp - TRUE_PEAK_CEILING_DBTP) + 0.05
+        limited_by = "true_peak"
+        out_bytes, quantized_samples = _quantize_pcm24(gain_db)
+        measured_tp = true_peak_fn(quantized_samples)
+
+    if measured_tp > TRUE_PEAK_CEILING_DBTP:
+        raise Failure("editing_true_peak_exceeded", 500)
+
+    metrics = inspect_wav(out_bytes)
+    if true_peak_fn is not true_peak_dbtp:
+        metrics["true_peak_dbtp"] = float(measured_tp)
+    metrics["applied_gain_db"] = round(float(gain_db), 4)
+    metrics["limited_by"] = limited_by
+    return out_bytes, metrics
+
+
+def normalize_editing_wav(path: Path, *, true_peak_fn=true_peak_dbtp) -> dict:
+    target = Path(path)
+    if target.stat().st_size > MAX_EDITING_BYTES:
+        raise Failure("output_too_large", 500)
+    raw = target.read_bytes()
+    out_bytes, metrics = normalize_editing_wav_bytes(raw, true_peak_fn=true_peak_fn)
+    if out_bytes != raw:
+        tmp = target.with_name(target.name + ".norm.tmp")
+        with tmp.open("wb") as stream:
+            stream.write(out_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, target)
+    return metrics
 
 
 def editing_copy(original: Path, output: Path, gain_db=0.0):

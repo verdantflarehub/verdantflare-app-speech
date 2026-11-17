@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 
+from . import __version__
 from .asr import ASR_MODEL_ID
 from .audio import MAX_REFERENCE_BYTES
 from .domain import Failure, Scope, canonical, strict_json, validate_create
@@ -116,7 +117,7 @@ def create_app(root=None, token=None, model_root=None, engine=None, model_hash=N
     @app.get("/v1/capabilities")
     def capabilities():
         asr = getattr(worker.engine, "asr", None)
-        return {"engine": "indextts2", "version": "0.1.5", "model_manifest_sha256": model_hash, "ready": worker.ready,
+        return {"engine": "indextts2", "version": __version__, "model_manifest_sha256": model_hash, "ready": worker.ready,
                 "load_seconds": getattr(worker.engine, "load_seconds", 0.0),
                 "asr_model": ASR_MODEL_ID, "asr_ready": bool(getattr(asr, "ready", False)),
                 "languages": ["zh-CN"], "reference_audio_required": True, "reference_max_seconds": 15,

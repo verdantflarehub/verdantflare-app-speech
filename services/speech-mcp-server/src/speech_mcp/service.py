@@ -17,16 +17,22 @@ from .domain import (
     public,
     validate,
 )
-from .gpu_lease import GpuCoordinator
+from .gpu_lease import GpuCoordinator, SchedulerLeaseClient
 
 VOICE_PATH = re.compile(r"^speech/voices/[a-z0-9][a-z0-9_-]{0,63}/profile\.json$")
 
 
 class Service:
-    def __init__(self, store, peers, model_hash, gpu=None, adapter=None, ratings=None):
+    def __init__(self, store, peers, model_hash, gpu=None, adapter=None, ratings=None, scheduler=None):
         validate("hash", model_hash)
         self.store, self.peers, self.model_hash = store, peers, model_hash
         self.gpu = gpu if gpu is not None else GpuCoordinator.from_environment()
+        self.scheduler = scheduler if scheduler is not None else SchedulerLeaseClient.from_environment(store=store)
+        if getattr(self.scheduler, "enabled", False):
+            if hasattr(self.gpu, "disable_legacy_lease"):
+                self.gpu.disable_legacy_lease()
+            elif getattr(self.gpu, "enabled", False):
+                self.gpu.enabled = False
         self.adapter = adapter if adapter is not None else DEFAULT_ADAPTER
         if ratings is not None:
             self.ratings = ratings
@@ -546,7 +552,7 @@ class Service:
         # the worker owns its lease, startup and actual model verification.
         # None is intentional: configuration is not an observed capability report.
         caps = None
-        if not self.gpu.enabled:
+        if not self._managed_runtime():
             caps = await self.peers.runtime.json(p, "GET", "/v1/capabilities", project_id=pid)
             if caps.get("model_manifest_sha256") != self.model_hash:
                 raise Failure("model_version_changed", 409)
@@ -566,8 +572,23 @@ class Service:
             state["emotion_reference_sha256"] = emo_ref_sha
         return public(await asyncio.to_thread(self.store.create, p, args, state))
 
+    def _managed_runtime(self) -> bool:
+        return bool(
+            getattr(self.gpu, "enabled", False)
+            or getattr(self.gpu, "scale_enabled", False)
+            or getattr(self.scheduler, "enabled", False)
+        )
+
     def _runtime_reason(self):
-        if not self.gpu.enabled:
+        if getattr(self.scheduler, "enabled", False) or getattr(self.gpu, "scale_enabled", False):
+            try:
+                reps = self.gpu.replicas_for() if hasattr(self.gpu, "replicas_for") else None
+                if reps == 0:
+                    return "scaled_to_zero"
+            except Exception:
+                return "connect_failed"
+            return "connect_failed"
+        if not getattr(self.gpu, "enabled", False):
             return "connect_failed"
         try:
             if self.gpu.peer_holder():

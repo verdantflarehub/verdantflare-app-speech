@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from .asr import WhisperSmallASR
-from .audio import TRUE_PEAK_CEILING_DBTP, digest_file, editing_copy, inspect_wav, quality_warnings
+from .audio import digest_file, editing_copy, inspect_wav, normalize_editing_wav, quality_warnings
 from .domain import Failure, canonical
 from .gpu_guard import FencePersistenceError, StaleFenceError
 from .store import atomic_write
@@ -177,16 +177,8 @@ class Worker:
             native = inspect_wav(original.read_bytes())
             editing = root / "editing.wav"
             self.converter(original, editing)
-            if editing.stat().st_size > 32 * 1024 * 1024:
-                raise Failure("output_too_large", 500)
-            derived = inspect_wav(editing.read_bytes())
-            gain_db = 0.0
-            # Fixed attenuation only; no compression or limiting that would alter the performance.
-            if derived["true_peak_dbtp"] > TRUE_PEAK_CEILING_DBTP:
-                gain_db = round(TRUE_PEAK_CEILING_DBTP - 0.1 - derived["true_peak_dbtp"], 2)
-                editing.unlink()  # ffmpeg with -nostdin refuses to overwrite.
-                self.converter(original, editing, gain_db=gain_db)
-                derived = inspect_wav(editing.read_bytes())
+            derived = normalize_editing_wav(editing)
+            gain_db = derived["applied_gain_db"]
             if derived["sample_rate_hz"] != 48000 or derived["bit_depth"] != 24:
                 raise Failure("invalid_editing_format", 500)
             if abs(native["duration_seconds"] - derived["duration_seconds"]) > 0.001:

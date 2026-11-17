@@ -151,19 +151,26 @@ class DurableQueue(Fixture):
             sf.write(buffer, samples, rate, format="WAV", subtype="PCM_" + str(width))
             return buffer.getvalue()
         calls = []
+        raw_orig = hot(22050, 16)
         class Engine:
             def generate(inner, reference, inputs, output):
-                output.write_bytes(hot(22050, 16))
+                output.write_bytes(raw_orig)
                 return {"test_engine": True}
         def convert(original, output, gain_db=0.0):
             calls.append(gain_db)
             output.write_bytes(hot(48000, 24, gain_db))
         task = self.store.create(self.scope, self.inputs)
         Worker(self.store, Engine(), convert).execute(self.store.claim())
-        report = json.loads((self.store.output_dir(task["task_id"]) / "report.json").read_text())
-        self.assertEqual(len(calls), 2)
+        out_dir = self.store.output_dir(task["task_id"])
+        report = json.loads((out_dir / "report.json").read_text())
+        self.assertEqual(calls, [0.0])
+        self.assertEqual((out_dir / "original.wav").read_bytes(), raw_orig)
         self.assertLess(report["editing_gain_db"], 0)
+        self.assertEqual(report["editing"]["applied_gain_db"], report["editing_gain_db"])
         self.assertLessEqual(report["editing"]["true_peak_dbtp"], -1.0)
+        self.assertIn(report["editing"]["limited_by"], ("none", "true_peak"))
+        self.assertContract(report)
+        self.assertContract(report["editing"])
         self.assertIn("true_peak_over", [w["code"] for w in report["warnings"]])
         self.assertIn("transcript_check", report)
         self.assertEqual(self.store.get(self.scope, task["task_id"])["status"], "succeeded")

@@ -18,8 +18,11 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
 import httpx
+
+log = logging.getLogger("speech_gpu_lease")
 
 LEASES = {
     "music3": "gpu-task-music3",
@@ -69,14 +72,26 @@ def held_by_other(lease: dict | None, holder: str, now: datetime) -> str | None:
     return None
 
 
+def _scheduler_env_enabled() -> bool:
+    url = os.environ.get("STATION_GPU_SCHEDULER_URL", "").strip()
+    tok = (
+        os.environ.get("STATION_GPU_SCHEDULER_TOKEN", "").strip()
+        or os.environ.get("STATION_RUNTIME_GPU_TOKEN", "").strip()
+    )
+    return bool(url and tok)
+
+
 class MemoryApi:
     """In-memory Lease and scale API for tests."""
 
     def __init__(self) -> None:
         self.leases: dict[str, dict] = {}
         self.scales: dict[str, int] = {}
+        self.pods: dict[str, list[dict]] = {}
+        self.lease_calls: list[tuple[str, str]] = []
 
     def get_lease(self, name: str) -> dict | None:
+        self.lease_calls.append(("get", name))
         item = self.leases.get(name)
         return None if item is None else {
             "metadata": dict(item["metadata"]),
@@ -84,6 +99,7 @@ class MemoryApi:
         }
 
     def replace_lease(self, name: str, spec: dict, resource_version: str | None) -> int:
+        self.lease_calls.append(("replace", name))
         current = self.leases.get(name)
         current_version = None if current is None else current["metadata"].get("resourceVersion")
         if current is not None and current_version != resource_version:
@@ -97,6 +113,13 @@ class MemoryApi:
 
     def patch_scale(self, name: str, replicas: int) -> None:
         self.scales[name] = replicas
+
+    def deployment_pods(self, name: str) -> list[dict]:
+        if name in self.pods:
+            return [dict(item) for item in self.pods[name]]
+        if self.scales.get(name, 0) > 0:
+            return [{"metadata": {"name": f"{name}-pod-0", "uid": f"uid-{name}-0"}, "status": {"phase": "Running"}}]
+        return []
 
 
 class K8sApi:
@@ -153,6 +176,27 @@ class K8sApi:
         response.raise_for_status()
         return replicas_from_scale(response.json())
 
+    def deployment_pods(self, name: str) -> list[dict]:
+        response = self._request("GET", f"/apis/apps/v1/namespaces/{self.namespace}/deployments/{name}")
+        if response.status_code == 403:
+            labels = {"app.kubernetes.io/name": name}
+        else:
+            response.raise_for_status()
+            selector = response.json()["spec"]["selector"]
+            labels = selector.get("matchLabels")
+            if not labels or selector.get("matchExpressions"):
+                raise RuntimeError("unsupported_deployment_selector")
+        response = self._request(
+            "GET",
+            f"/api/v1/namespaces/{self.namespace}/pods",
+            params={"labelSelector": ",".join(f"{k}={v}" for k, v in labels.items())},
+        )
+        response.raise_for_status()
+        items = response.json().get("items")
+        if not isinstance(items, list):
+            raise RuntimeError("invalid_pod_list")
+        return items
+
     def patch_scale(self, name: str, replicas: int) -> None:
         path = f"/apis/apps/v1/namespaces/{self.namespace}/deployments/{name}/scale"
         response = self._request(
@@ -196,23 +240,56 @@ class GpuCoordinator:
         self.idle_at: float | None = None
         self._lock = threading.RLock()
         self.activity = None
+        self._legacy_role_warned = False
 
     @property
     def lease_name(self) -> str:
         return LEASES[self.role]
 
+    @property
+    def scale_enabled(self) -> bool:
+        return bool(self.api is not None and self.deployment)
+
+    def disable_legacy_lease(self, *, residual_role: str | None = None) -> None:
+        role = (residual_role if residual_role is not None else self.role) or ""
+        role = role.strip()
+        if role and not self._legacy_role_warned:
+            log.warning(
+                "speech_legacy_gpu_task_role_ignored role=%s reason=station_gpu_scheduler_enabled",
+                role,
+            )
+            self._legacy_role_warned = True
+        self.enabled = False
+        self.role = ""
+        self.holder = ""
+
     @classmethod
     def from_environment(cls) -> "GpuCoordinator":
         role = os.environ.get("GPU_TASK_ROLE", "").strip()
-        if role not in CONFLICTS:
-            return cls(api=None, role="", holder="", enabled=False)
+        deployment = os.environ.get("GPU_TASK_DEPLOYMENT", "").strip() or None
         namespace = os.environ.get("GPU_TASK_NAMESPACE", "").strip()
         namespace_file = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
         if not namespace and namespace_file.is_file():
             namespace = namespace_file.read_text(encoding="utf-8").strip()
         namespace = namespace or "verdantflare-app"
+        if _scheduler_env_enabled():
+            coord = cls(
+                api=K8sApi(namespace) if deployment else None,
+                role="",
+                holder="",
+                deployment=deployment,
+                enabled=False,
+                idle_seconds=int(os.environ.get("GPU_IDLE_SECONDS", "600")),
+                queue_seconds=int(os.environ.get("GPU_QUEUE_SECONDS", "1200")),
+                ready_seconds=int(os.environ.get("GPU_READY_SECONDS", "900")),
+                lease_seconds=int(os.environ.get("GPU_LEASE_SECONDS", "90")),
+            )
+            if role:
+                coord.disable_legacy_lease(residual_role=role)
+            return coord
+        if role not in CONFLICTS:
+            return cls(api=None, role="", holder="", enabled=False)
         holder = os.environ.get("GPU_TASK_HOLDER", "").strip() or f"{role}/{os.environ.get('HOSTNAME', 'local')}"
-        deployment = os.environ.get("GPU_TASK_DEPLOYMENT", "").strip() or None
         return cls(
             api=K8sApi(namespace),
             role=role,
@@ -236,13 +313,19 @@ class GpuCoordinator:
         return None
 
     def api_ok(self) -> bool:
-        if not self.enabled:
-            return True
-        try:
-            self.api.get_lease(self.lease_name)
-            return True
-        except Exception:
-            return False
+        if self.enabled:
+            try:
+                self.api.get_lease(self.lease_name)
+                return True
+            except Exception:
+                return False
+        if self.scale_enabled:
+            try:
+                self.api.get_scale(self.deployment)
+                return True
+            except Exception:
+                return False
+        return True
 
     def replicas(self) -> int | None:
         if not self.enabled or not self.deployment:
@@ -252,11 +335,50 @@ class GpuCoordinator:
         except Exception:
             return None
 
+    def replicas_for(self, deployment: str | None = None) -> int | None:
+        target = deployment or self.deployment
+        if self.api is None or not target:
+            return None
+        try:
+            return int(self.api.get_scale(target))
+        except Exception:
+            return None
+
     def scale_to(self, replicas: int) -> None:
         if not self.enabled or not self.deployment:
             return
         if self.api.get_scale(self.deployment) != replicas:
             self.api.patch_scale(self.deployment, replicas)
+
+    def scale_deployment_to(self, replicas: int, deployment: str | None = None) -> None:
+        target = deployment or self.deployment
+        if self.api is None or not target:
+            return
+        if self.api.get_scale(target) != replicas:
+            self.api.patch_scale(target, replicas)
+
+    def deployment_pods(self, deployment: str | None = None) -> list[dict]:
+        target = deployment or self.deployment
+        if self.api is None or not target or not hasattr(self.api, "deployment_pods"):
+            return []
+        return list(self.api.deployment_pods(target))
+
+    def stop_deployment_and_wait(self, deployment: str | None = None, *, on_wait=None) -> None:
+        target = deployment or self.deployment
+        if self.api is None or not target:
+            raise RuntimeError("gpu_shutdown_unavailable")
+        self.scale_deployment_to(0, target)
+        deadline = self._monotonic() + self.ready_seconds
+        while True:
+            # Include terminating/terminal Pods: desired replicas=0 alone is insufficient.
+            if not self.deployment_pods(target):
+                return
+            if self._monotonic() >= deadline:
+                raise RuntimeError("gpu_shutdown_timeout")
+            if on_wait is not None:
+                with contextlib.suppress(Exception):
+                    on_wait()
+            self._sleep(1)
 
     def _spec(self, holder: str, acquire_time: str | None = None) -> dict:
         now = format_time(self._now())
@@ -839,6 +961,53 @@ class SchedulerLeaseClient:
 
     def get_lease(self, lease_id: str) -> dict:
         return self._request("GET", f"/internal/v1/gpu-scheduler/leases/{lease_id}")
+
+    def list_own_leases(self) -> list[dict]:
+        if not self.enabled:
+            return []
+        query = urlencode({"holder_app_id": self.holder_app_id})
+        try:
+            resp = self._request_raw("GET", f"/internal/v1/gpu-scheduler/leases?{query}")
+        except Exception:
+            return []
+        if resp.status_code in {404, 405}:
+            return []
+        if resp.status_code >= 400:
+            return []
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError:
+            return []
+        items = data
+        if isinstance(data, dict):
+            items = data.get("leases") if isinstance(data.get("leases"), list) else data.get("items")
+        if not isinstance(items, list):
+            return []
+        unsettled = {"queued", "leased", "running", "granted", "draining", "reclaiming"}
+        out: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict) or not str(item.get("lease_id") or "").strip():
+                continue
+            holder = str(item.get("holder_app_id") or "").strip()
+            if holder and holder != self.holder_app_id:
+                continue
+            state = str(item.get("state") or "").strip().lower()
+            if state in unsettled:
+                out.append(dict(item))
+        return out
+
+    def list_pending_release_ids(self) -> list[str]:
+        if self._pending_backend == "postgres":
+            store = self._store
+            if store is not None and hasattr(store, "list_pending_gpu_releases"):
+                return [
+                    str(r.get("lease_id") or "").strip()
+                    for r in store.list_pending_gpu_releases()
+                    if isinstance(r, dict) and str(r.get("lease_id") or "").strip()
+                ]
+            return []
+        with self._pending_lock:
+            return [lid for lid in self._pending_releases if lid]
 
     def bind_target(
         self,

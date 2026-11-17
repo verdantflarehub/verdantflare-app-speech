@@ -5,8 +5,17 @@ import unittest
 import numpy as np
 import soundfile as sf
 
+from speech_runtime import __version__
 from speech_runtime.asr import WhisperSmallASR, compare_transcript
-from speech_runtime.audio import inspect_wav, integrated_lufs, quality_warnings, silence_edges, true_peak_dbtp
+from speech_runtime.audio import (
+    compute_editing_gain,
+    inspect_wav,
+    integrated_lufs,
+    normalize_editing_wav_bytes,
+    quality_warnings,
+    silence_edges,
+    true_peak_dbtp,
+)
 from speech_runtime.domain import Failure, validate_create
 
 
@@ -158,6 +167,98 @@ class TranscriptCheck(unittest.TestCase):
             validate_create(base | {"emotion_vector": [0] * 8, "emotion_text": "平静"})
         with self.assertRaises(Failure):
             validate_create(base | {"emotion_text": "平静", "emotion_reference": {"reference_sha256": "b" * 64, "alpha": 0.5}})
+
+
+class LinearLoudnessNormalization(unittest.TestCase):
+    @staticmethod
+    def _pcm24_wav(samples, rate=48000) -> bytes:
+        buf = io.BytesIO()
+        sf.write(buf, np.asarray(samples, dtype=np.float64), rate, format="WAV", subtype="PCM_24")
+        return buf.getvalue()
+
+    def test_version_bumped_to_0_1_10(self):
+        self.assertEqual(__version__, "0.1.10")
+
+    def test_d01_high_loudness_attenuates_to_minus_16_lufs_without_compression(self):
+        rate = 48000
+        # Calibrate a steady tone whose integrated loudness is ~ -10.49 LUFS (like D01) and peak ~ -1.10 dBTP
+        base_tone = sine(1000, 2.844, rate, 0.1)
+        base_lufs = integrated_lufs(base_tone, rate)
+        amp_scale = 10.0 ** ((-10.4872 - base_lufs) / 20.0)
+        d01_like = base_tone * amp_scale
+        raw_in = self._pcm24_wav(d01_like, rate)
+        in_report = inspect_wav(raw_in)
+        self.assertAlmostEqual(in_report["integrated_lufs"], -10.49, delta=0.1)
+
+        out_bytes, metrics = normalize_editing_wav_bytes(raw_in)
+        self.assertEqual(metrics["limited_by"], "none")
+        self.assertAlmostEqual(metrics["applied_gain_db"], -5.5128, delta=0.1)
+        self.assertAlmostEqual(metrics["integrated_lufs"], -16.0, delta=0.05)
+        self.assertLessEqual(metrics["true_peak_dbtp"], -1.0)
+        self.assertAlmostEqual(metrics["duration_seconds"], in_report["duration_seconds"], places=6)
+
+        # Verify pure linear gain (constant ratio across samples, zero compression/limiting)
+        with sf.SoundFile(io.BytesIO(raw_in)) as src_w, sf.SoundFile(io.BytesIO(out_bytes)) as dst_w:
+            x_in = src_w.read(src_w.frames, dtype="float64")
+            x_out = dst_w.read(dst_w.frames, dtype="float64")
+        mask = np.abs(x_in) > 0.05
+        expected_ratio = 10.0 ** (metrics["applied_gain_db"] / 20.0)
+        np.testing.assert_allclose(x_out[mask] / x_in[mask], expected_ratio, rtol=1e-4, atol=1e-5)
+
+    def test_quiet_utterance_capped_at_plus_12db_max_boost(self):
+        rate = 48000
+        # Amplitude 0.025 -> ~ -35 LUFS; +12 dB cap yields ~ -23 LUFS (never boosting noise floor by +19 dB)
+        quiet = sine(1000, 2.5, rate, 0.025)
+        raw_in = self._pcm24_wav(quiet, rate)
+        in_lufs = inspect_wav(raw_in)["integrated_lufs"]
+        self.assertLess(in_lufs, -32.0)
+
+        _, metrics = normalize_editing_wav_bytes(raw_in)
+        self.assertEqual(metrics["limited_by"], "max_boost")
+        self.assertEqual(metrics["applied_gain_db"], 12.0)
+        self.assertAlmostEqual(metrics["integrated_lufs"], in_lufs + 12.0, delta=0.05)
+        self.assertLess(metrics["integrated_lufs"], -19.0)
+        self.assertLessEqual(metrics["true_peak_dbtp"], -1.0)
+
+    def test_peak_conflict_prioritizes_minus_1_dbtp_ceiling_and_post_quant_recheck(self):
+        rate = 48000
+        # Quiet body (~ -23 LUFS -> wants +7 dB) with a sharp transient crest at -2.5 dBFS (peak_cap ~ +1.4 dB)
+        body = sine(440, 2.5, rate, 0.1)
+        body[rate // 2 : rate // 2 + 24] = 0.75 * np.sin(np.linspace(0, math.pi, 24))
+        raw_in = self._pcm24_wav(body, rate)
+
+        _, metrics = normalize_editing_wav_bytes(raw_in)
+        self.assertEqual(metrics["limited_by"], "true_peak")
+        self.assertLessEqual(metrics["true_peak_dbtp"], -1.0)
+        self.assertLess(metrics["integrated_lufs"], -18.0)
+
+        # Simulate post-PCM24-quantization 4x oversampling re-measurement exceeding -1.0 dBTP on first pass
+        calls = {"n": 0}
+
+        def synthetic_tp(arr):
+            calls["n"] += 1
+            real_tp = true_peak_dbtp(arr)
+            if calls["n"] == 2:
+                return -0.82  # Force post-quantization step-down iteration
+            return real_tp
+
+        moderate = self._pcm24_wav(sine(1000, 2.0, rate, 0.1), rate)
+        _, stepped = normalize_editing_wav_bytes(moderate, true_peak_fn=synthetic_tp)
+        self.assertGreaterEqual(calls["n"], 3)
+        self.assertEqual(stepped["limited_by"], "true_peak")
+        self.assertLessEqual(stepped["true_peak_dbtp"], -1.0)
+
+    def test_near_silence_at_or_below_minus_60_lufs_is_never_amplified(self):
+        rate = 48000
+        near_silent = sine(1000, 2.0, rate, 2e-4)  # ~ -69.9 LUFS <= -60.0 LUFS
+        raw_in = self._pcm24_wav(near_silent, rate)
+        self.assertLessEqual(inspect_wav(raw_in)["integrated_lufs"], -60.0)
+
+        out_bytes, metrics = normalize_editing_wav_bytes(raw_in)
+        self.assertEqual(metrics["limited_by"], "silence")
+        self.assertEqual(metrics["applied_gain_db"], 0.0)
+        self.assertEqual(out_bytes, raw_in)
+        self.assertEqual(compute_editing_gain(-60.0, -55.0), (0.0, "silence"))
 
 
 if __name__ == "__main__":

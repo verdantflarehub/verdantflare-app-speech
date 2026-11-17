@@ -623,6 +623,38 @@
         }
       ]
     },
+    "editing_metrics": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/audio_metrics"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "true_peak_dbtp": {
+              "type": "number",
+              "maximum": -1.0
+            },
+            "applied_gain_db": {
+              "type": "number",
+              "maximum": 12
+            },
+            "limited_by": {
+              "enum": [
+                "none",
+                "true_peak",
+                "max_boost",
+                "silence"
+              ]
+            }
+          },
+          "required": [
+            "applied_gain_db",
+            "limited_by"
+          ]
+        }
+      ]
+    },
     "quality_report": {
       "description": "Fields added to report.json. Warnings never change task status.",
       "type": "object",
@@ -631,11 +663,11 @@
           "$ref": "#/$defs/audio_metrics"
         },
         "editing": {
-          "$ref": "#/$defs/audio_metrics"
+          "$ref": "#/$defs/editing_metrics"
         },
         "editing_gain_db": {
           "type": "number",
-          "maximum": 0
+          "maximum": 12
         },
         "shot_window_seconds": {
           "type": "number",
@@ -803,15 +835,47 @@
               "type": "number",
               "minimum": 0
             },
+            "execution_seconds": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "execution_source": {
+              "enum": [
+                "report.top",
+                "report.metrics",
+                "missing"
+              ]
+            },
             "inference_seconds": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "turnaround_seconds": {
               "type": "number",
+              "minimum": 0
+            },
+            "queue_wait_seconds": {
+              "type": [
+                "number",
+                "null"
+              ],
               "minimum": 0
             }
           },
           "required": [
             "queue_seconds",
             "load_seconds",
-            "inference_seconds"
+            "execution_seconds",
+            "execution_source",
+            "inference_seconds",
+            "turnaround_seconds",
+            "queue_wait_seconds"
           ],
           "additionalProperties": false
         }

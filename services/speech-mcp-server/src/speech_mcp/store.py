@@ -199,6 +199,66 @@ class Store:
                 AND NOT (status='failed' AND phase IN ('reference','loading_model'))
                 ) AS active""").fetchone()["active"]
 
+    def has_active_gpu_tasks(
+        self,
+        *,
+        exclude_task_id: str | None = None,
+        include_unarchived_runtime_outputs: bool = True,
+    ) -> bool:
+        excl = str(exclude_task_id or "").strip()
+        phases = (
+            ("reference", "loading_model", "submit", "inference", "archive")
+            if include_unarchived_runtime_outputs
+            else ("reference", "loading_model", "submit", "inference")
+        )
+        with self.connect() as c:
+            if include_unarchived_runtime_outputs:
+                row = c.execute(
+                    """SELECT EXISTS (
+                        SELECT 1 FROM speech_tasks
+                        WHERE status IN ('pending','running')
+                          AND phase = ANY(%s)
+                          AND (%s = '' OR task_id <> %s)
+                    ) AS active""",
+                    (list(phases), excl, excl),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    """SELECT EXISTS (
+                        SELECT 1 FROM speech_tasks
+                        WHERE status IN ('pending','running')
+                          AND (
+                              phase IN ('reference','loading_model','submit')
+                              OR (phase = 'inference' AND COALESCE(state->>'gpu_execution_finished', 'false') <> 'true')
+                          )
+                          AND (%s = '' OR task_id <> %s)
+                    ) AS active""",
+                    (excl, excl),
+                ).fetchone()
+        return bool(row and row["active"])
+
+    def list_tasks_with_scheduler_leases(self) -> list[dict]:
+        with self.connect() as c:
+            return c.execute(
+                """SELECT task_id, project_id, status, phase, state, principal
+                   FROM speech_tasks
+                   WHERE jsonb_typeof(state->'gpu_scheduler_lease') = 'object'
+                   ORDER BY updated_at ASC"""
+            ).fetchall()
+
+    def clear_task_scheduler_lease(self, task_id: str, lease_id: str) -> bool:
+        with self.connect() as c:
+            n = c.execute(
+                """UPDATE speech_tasks
+                   SET state = (state - 'gpu_scheduler_lease') - 'gpu_queue',
+                       updated_at = now()
+                   WHERE task_id = %s
+                     AND state->'gpu_scheduler_lease'->>'lease_id' = %s
+                     AND (lease_until IS NULL OR lease_until <= now() OR status IN ('succeeded','failed'))""",
+                (str(task_id), str(lease_id)),
+            ).rowcount
+        return n == 1
+
     def rename_task(self, task_id: str, title: str, p=None):
         if not isinstance(title, str):
             raise Failure("invalid_arguments", 400)
@@ -396,6 +456,12 @@ class Store:
                 "SELECT * FROM speech_gpu_pending_releases WHERE lease_id = %s",
                 (str(lease_id),),
             ).fetchone()
+
+    def list_pending_gpu_releases(self) -> list[dict]:
+        with self.connect() as c:
+            return c.execute(
+                "SELECT lease_id, fencing_token, status, payload FROM speech_gpu_pending_releases ORDER BY updated_at ASC"
+            ).fetchall()
 
 
 TaskStore = Store

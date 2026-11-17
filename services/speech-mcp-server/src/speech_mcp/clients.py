@@ -99,6 +99,36 @@ class Client:
     async def json(self, p, method, path, payload=None, **kwargs):
         return strict_json(await self.request(p, method, path, payload, **kwargs))
 
+    async def request_status_json(self, method, path, payload=None, *, p=None, project_id=None, extra_headers=None, limit=65536):
+        headers = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json"}
+        if isinstance(p, dict) and p.get("organization_id") and p.get("subject_id") and p.get("request_id"):
+            headers["X-Organization-Id"] = p["organization_id"]
+            headers["X-User-Id"] = p["subject_id"]
+            headers["X-Request-Id"] = p["request_id"]
+        if project_id:
+            headers["X-Project-Id"] = project_id
+        if isinstance(extra_headers, dict):
+            for hk, hv in extra_headers.items():
+                if hk and hv is not None and hk.lower() != "authorization":
+                    headers[str(hk)] = str(hv)
+        data = canonical(payload).encode() if payload is not None else None
+        try:
+            async with self.http.stream(method, self.base + path, headers=headers, content=data) as r:
+                raw = bytearray()
+                async for chunk in r.aiter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > limit:
+                        return r.status_code, None
+                if not raw:
+                    return r.status_code, None
+                try:
+                    parsed = strict_json(bytes(raw))
+                except Failure:
+                    return r.status_code, None
+                return r.status_code, parsed if isinstance(parsed, dict) else None
+        except httpx.HTTPError:
+            raise Failure("dependency_unavailable", 503, True) from None
+
 
 class Peers:
     def __init__(self, project, artifact, runtime, world=None):
