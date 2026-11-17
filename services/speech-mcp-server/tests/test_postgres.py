@@ -12,6 +12,37 @@ from speech_mcp.store import Store
 
 @unittest.skipUnless(os.environ.get("SPEECH_TEST_DATABASE_URL"), "5090 database required")
 class PostgresTests(unittest.TestCase):
+    def test_result_recovery_precedes_new_gpu_admission(self):
+        dsn = os.environ["SPEECH_TEST_DATABASE_URL"]
+        schema = "speech_test_" + new_id().replace("-", "")
+        with psycopg.connect(dsn) as c:
+            c.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
+        class IsolatedStore(Store):
+            def connect(self):
+                c = super().connect()
+                c.execute(psycopg.sql.SQL("SET search_path TO {}").format(psycopg.sql.Identifier(schema)))
+                return c
+        try:
+            store = IsolatedStore(dsn)
+            store.migrate()
+            principal = {k: new_id() for k in ("organization_id", "subject_id", "request_id")}
+            request = {"project_id": new_id(), "text": "test"}
+            queued = store.create(principal, request | {"idempotency_key": "queued"}, {})
+            result = store.create(principal, request | {"idempotency_key": "result"}, {})
+            with store.connect() as c:
+                c.execute("UPDATE speech_tasks SET phase='inference' WHERE task_id=%s", (result["task_id"],))
+                c.execute("UPDATE speech_tasks SET phase='reference',next_attempt=now()-interval '1 hour' WHERE task_id=%s", (queued["task_id"],))
+            first = store.claim()
+            self.assertEqual(first["task_id"], result["task_id"])
+            # Priority cannot steal an active lease; the other worker gets queued work.
+            second = store.claim()
+            self.assertEqual(second["task_id"], queued["task_id"])
+            store.save(first, status="running", phase="inference", delay=60)
+            self.assertIsNone(store.claim())  # Future retry is still respected.
+        finally:
+            with psycopg.connect(dsn) as c:
+                c.execute(psycopg.sql.SQL("DROP SCHEMA {} CASCADE").format(psycopg.sql.Identifier(schema)))
+
     def test_concurrent_idempotency_leases_restart_and_fencing(self):
         dsn = os.environ["SPEECH_TEST_DATABASE_URL"]
         schema = "speech_test_" + new_id().replace("-", "")

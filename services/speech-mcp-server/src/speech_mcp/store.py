@@ -155,7 +155,8 @@ class Store:
             return c.execute("""WITH candidate AS (
                 SELECT task_id FROM speech_tasks WHERE status IN ('pending','running')
                 AND next_attempt<=now() AND (lease_until IS NULL OR lease_until<now())
-                ORDER BY next_attempt,created_at FOR UPDATE SKIP LOCKED LIMIT 1)
+                ORDER BY CASE WHEN phase IN ('inference','archive','complete') THEN 0 ELSE 1 END,
+                         next_attempt,created_at FOR UPDATE SKIP LOCKED LIMIT 1)
                 UPDATE speech_tasks t SET status='running',lease_token=%s,
                 lease_until=now()+interval '120 seconds',updated_at=now()
                 FROM candidate WHERE t.task_id=candidate.task_id RETURNING t.*""", (new_id(),)).fetchone()
