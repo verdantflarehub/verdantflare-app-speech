@@ -56,23 +56,30 @@ class Worker:
         while True:
             await asyncio.sleep(20)
             await asyncio.to_thread(self.store.renew, row)
-            if row["state"].get("gpu_held") and self.gpu.enabled:
-                try:
-                    await asyncio.to_thread(self.gpu.renew)
-                except LeaseBusy as error:
-                    raise Failure("waiting_gpu_lease", 503, True) from error
-            sched_lease = row["state"].get("gpu_scheduler_lease")
-            if self.scheduler.enabled and is_lease_granted(sched_lease):
-                try:
-                    renewed = await asyncio.to_thread(
-                        self.scheduler.heartbeat,
-                        str(sched_lease["lease_id"]),
-                        int(sched_lease["fencing_token"]),
-                    )
-                    if isinstance(renewed, dict) and renewed.get("lease_id"):
-                        row["state"]["gpu_scheduler_lease"] = renewed
-                except Exception as error:
-                    raise Failure("waiting_gpu_lease", 503, True) from error
+            # Observe the receiver before renewing GPU occupancy: it may already
+            # be settled. A GPU heartbeat failure must not cancel that read.
+            if row["phase"] not in {"inference", "archive", "complete"}:
+                await self._renew_execution_lease(row)
+
+    async def _renew_execution_lease(self, row):
+        """Renew existing occupancy only; never acquire or start another attempt."""
+        if row["state"].get("gpu_held") and self.gpu.enabled:
+            try:
+                await asyncio.to_thread(self.gpu.renew)
+            except LeaseBusy as error:
+                raise Failure("waiting_gpu_lease", 503, True) from error
+        sched_lease = row["state"].get("gpu_scheduler_lease")
+        if self.scheduler.enabled and is_lease_granted(sched_lease):
+            try:
+                renewed = await asyncio.to_thread(
+                    self.scheduler.heartbeat,
+                    str(sched_lease["lease_id"]),
+                    int(sched_lease["fencing_token"]),
+                )
+                if isinstance(renewed, dict) and renewed.get("lease_id"):
+                    row["state"]["gpu_scheduler_lease"] = renewed
+            except Exception as error:
+                raise Failure("waiting_gpu_lease", 503, True) from error
 
     async def run(self):
         if self.scheduler.enabled:
@@ -139,7 +146,7 @@ class Worker:
         pid, phase = row["project_id"], row["phase"]
         timings = state.setdefault("timings", {"queue_seconds": 0.0, "load_seconds": 0.0, "inference_seconds": 0.0})
         await self.peers.open(p, pid, write=True)
-        if phase in ("reference", "loading_model", "submit", "inference"):
+        if phase in ("reference", "loading_model", "submit"):
             await self._ensure_gpu(row)
             if phase == "loading_model":
                 phase = "reference"
@@ -217,6 +224,7 @@ class Worker:
                 code = task.get("error", {}).get("code")
                 raise Failure(code if code in ("recovery_required", "model_version_changed", "stale_fencing_token") else "inference_failed", 409)
             if task["status"] != "succeeded":
+                await self._renew_execution_lease(row)
                 await self.save(row, delay=2)
                 return
             if state.get("submit_started_at") and not timings.get("inference_seconds"):
