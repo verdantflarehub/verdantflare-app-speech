@@ -208,12 +208,12 @@ class PostgresTests(unittest.TestCase):
                     "reclaim_mode": "abort_unstarted",
                 },
                 owner_pod_uid="pod-uid-old",
-                claim_seconds=1,
+                claim_seconds=3,
             )
             # Destroy Pod A's ephemeral /tmp completely (Recreate replacement)
             shutil.rmtree(pod_a_tmp, ignore_errors=True)
 
-            # While Pod A's 1s claim_until is still active, Pod B does not steal an in-flight claim
+            # While Pod A's 3s claim_until is still active, Pod B does not steal an in-flight claim
             sched_pod_b = SchedulerLeaseClient(
                 base_url="http://station-runtime:5056",
                 token="sched-token",
@@ -226,8 +226,8 @@ class PostgresTests(unittest.TestCase):
             )
             self.assertEqual(sched_pod_b.flush_pending_releases(), 0)
 
-            # Wait for Pod A's claim_until (1s) to expire; Pod B starts Worker.run() with ZERO speech tasks
-            time.sleep(1.2)
+            # Wait for Pod A's claim_until (3s) to expire; Pod B starts Worker.run() with ZERO speech tasks
+            time.sleep(3.2)
             gpu = GpuCoordinator(MemoryApi(), "indextts2", "speech/pod-b", deployment="speech", enabled=False)
             peers = SimpleNamespace(open=AsyncMock(), runtime=SimpleNamespace(json=AsyncMock()))
             with patch("speech_mcp.worker.threading.Thread.start"):
@@ -372,6 +372,26 @@ class PostgresTests(unittest.TestCase):
             self.assertEqual(sched_short_claim.flush_pending_releases(), 3)
             for idx in range(3):
                 self.assertIsNone(store.get_pending_gpu_release(f"lease-r4-batch-{idx}"))
+
+            # 5) Pre-inference stale_fencing_token row (outputs=[]) is requeued on startup while non-empty outputs stay untouched
+            from test_speech import fixture
+            p, req, base_row = fixture()
+            created_stale = store.create(p, req, base_row["state"])
+            claimed_stale = store.claim()
+            claimed_stale["state"]["outputs"] = []
+            claimed_stale["state"]["submit_dispatched"] = True
+            claimed_stale["state"]["runtime_task_id"] = "01a1eac7-ba48-7f91-a448-55bd3fa57803"
+            claimed_stale["state"]["runtime_inputs"] = {"idempotency_key": f"speech-{created_stale['task_id']}"}
+            store.save(claimed_stale, phase="inference", status="failed", error="stale_fencing_token")
+            requeued = store.requeue_preinference_stale_fence_tasks()
+            self.assertEqual(requeued, [created_stale["task_id"]])
+            reloaded = store.get(p, req["project_id"], created_stale["task_id"])
+            self.assertEqual(reloaded["status"], "running")
+            self.assertEqual(reloaded["phase"], "reference")
+            self.assertIsNone(reloaded["last_error"])
+            self.assertEqual(reloaded["state"]["fence_retry_count"], 1)
+            self.assertEqual(reloaded["state"]["runtime_inputs"]["idempotency_key"], f"speech-{created_stale['task_id']}-r1")
+            self.assertNotIn("runtime_task_id", reloaded["state"])
         finally:
             with psycopg.connect(dsn) as c:
                 c.execute(psycopg.sql.SQL("DROP SCHEMA {} CASCADE").format(psycopg.sql.Identifier(schema)))

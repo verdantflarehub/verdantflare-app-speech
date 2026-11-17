@@ -263,6 +263,61 @@ class Store:
             ).rowcount
         return n == 1
 
+    def requeue_preinference_stale_fence_tasks(self, *, max_retries: int = 5) -> list[str]:
+        requeued: list[str] = []
+        with self.connect() as c:
+            rows = c.execute(
+                """SELECT task_id, state
+                   FROM speech_tasks
+                   WHERE status = 'failed'
+                     AND last_error = 'stale_fencing_token'
+                     AND phase IN ('reference', 'loading_model', 'submit', 'inference')
+                     AND jsonb_array_length(
+                         CASE WHEN jsonb_typeof(state->'outputs') = 'array'
+                              THEN state->'outputs'
+                              ELSE '[]'::jsonb
+                         END
+                     ) = 0
+                     AND COALESCE((state->>'fence_retry_count')::int, 0) < %s
+                     AND (lease_until IS NULL OR lease_until <= now())
+                   ORDER BY created_at ASC
+                   FOR UPDATE SKIP LOCKED""",
+                (int(max_retries),),
+            ).fetchall()
+            for r in rows:
+                tid = str(r["task_id"])
+                st = dict(r.get("state") or {})
+                retry_cnt = int(st.get("fence_retry_count") or 0) + 1
+                st["fence_retry_count"] = retry_cnt
+                st.pop("submit_dispatched", None)
+                st.pop("runtime_task_id", None)
+                st.pop("gpu_execution_finished", None)
+                st.pop("gpu_reclaim_proof", None)
+                st.pop("gpu_scheduler_lease", None)
+                st.pop("gpu_queue", None)
+                if isinstance(st.get("runtime_inputs"), dict):
+                    rt_in = dict(st["runtime_inputs"])
+                    rt_in["idempotency_key"] = f"speech-{tid}-r{retry_cnt}"
+                    st["runtime_inputs"] = rt_in
+                target_phase = (
+                    "reference"
+                    if isinstance(st.get("profile"), dict) and isinstance(st["profile"].get("reference"), dict)
+                    else "submit"
+                )
+                c.execute(
+                    """UPDATE speech_tasks
+                       SET status = 'running',
+                           phase = %s,
+                           last_error = NULL,
+                           state = %s,
+                           next_attempt = now(),
+                           updated_at = now()
+                       WHERE task_id = %s""",
+                    (target_phase, Jsonb(st), tid),
+                )
+                requeued.append(tid)
+        return requeued
+
     def rename_task(self, task_id: str, title: str, p=None):
         if not isinstance(title, str):
             raise Failure("invalid_arguments", 400)

@@ -373,7 +373,51 @@ class Worker:
             else:
                 deferred.append(lid)
 
+        requeued = await self._requeue_stale_fence_tasks()
+        for tid in requeued:
+            log.info("speech_startup_requeued_stale_fence_task task_id=%s", tid)
+
         return {"adopted": adopted, "released": released, "deferred": deferred}
+
+    async def _requeue_stale_fence_tasks(self) -> list[str]:
+        fn = getattr(self.store, "requeue_preinference_stale_fence_tasks", None)
+        if callable(fn) and _has_custom_attr(self.store, "requeue_preinference_stale_fence_tasks"):
+            res = await asyncio.to_thread(fn)
+            return list(res) if isinstance(res, list) else []
+        rows = getattr(self.store, "rows", None)
+        if not isinstance(rows, dict):
+            return []
+        requeued: list[str] = []
+        for tid, r in list(rows.items()):
+            if not isinstance(r, dict):
+                continue
+            st = r.get("state") if isinstance(r.get("state"), dict) else {}
+            if (
+                r.get("status") == "failed"
+                and r.get("last_error") == "stale_fencing_token"
+                and r.get("phase") in {"reference", "loading_model", "submit", "inference"}
+                and not (st.get("outputs") or [])
+                and int(st.get("fence_retry_count") or 0) < 5
+            ):
+                retry_cnt = int(st.get("fence_retry_count") or 0) + 1
+                st["fence_retry_count"] = retry_cnt
+                st.pop("submit_dispatched", None)
+                st.pop("runtime_task_id", None)
+                st.pop("gpu_execution_finished", None)
+                st.pop("gpu_reclaim_proof", None)
+                st.pop("gpu_scheduler_lease", None)
+                st.pop("gpu_queue", None)
+                if isinstance(st.get("runtime_inputs"), dict):
+                    st["runtime_inputs"]["idempotency_key"] = f"speech-{tid}-r{retry_cnt}"
+                r["phase"] = (
+                    "reference"
+                    if isinstance(st.get("profile"), dict) and isinstance(st["profile"].get("reference"), dict)
+                    else "submit"
+                )
+                r["status"] = "running"
+                r["last_error"] = None
+                requeued.append(str(tid))
+        return requeued
 
     async def _drain_orphan_leases(self) -> int:
         with self._orphan_lock:
@@ -655,12 +699,13 @@ class Worker:
             if can_release_sched:
                 await self._release_scheduler_lease(row, reason=f"failed:{error.code}")
             if error.code != "lease_lost":
+                retry_delay = 2 if (error.retry and error.code in {"stale_fencing_token", "dependency_not_found"}) else 15
                 await asyncio.to_thread(
                     self.store.save,
                     row,
                     status="running" if error.retry else "failed",
                     error=error.code,
-                    delay=15,
+                    delay=retry_delay,
                 )
             if release_gpu:
                 await asyncio.to_thread(self.gpu.release)
@@ -803,8 +848,10 @@ class Worker:
             )
             text_rec = state.get("text") or build_text_record(req["text"])
             state["text"] = text_rec
+            fence_retry_count = int(state.get("fence_retry_count") or 0)
+            rt_idem = f"speech-{row['task_id']}-r{fence_retry_count}" if fence_retry_count > 0 else "speech-" + row["task_id"]
             runtime_inputs = {
-                "idempotency_key": "speech-" + row["task_id"],
+                "idempotency_key": rt_idem,
                 "text": text_rec["sent"],
                 "language": req["language"],
                 "reference_sha256": digest(data),
@@ -847,9 +894,39 @@ class Worker:
             )
             extra_kw = {"extra_headers": grant_headers} if grant_headers else {}
             state["submit_dispatched"] = True
-            task = await self.peers.runtime.json(
-                p, "POST", "/v1/tasks", state["runtime_inputs"], project_id=pid, **extra_kw
-            )
+            try:
+                task = await self.peers.runtime.json(
+                    p, "POST", "/v1/tasks", state["runtime_inputs"], project_id=pid, **extra_kw
+                )
+            except Failure as exc:
+                if exc.code == "stale_fencing_token" and int(state.get("fence_retry_count") or 0) < 5:
+                    fence_retry_count = int(state.get("fence_retry_count") or 0) + 1
+                    state["fence_retry_count"] = fence_retry_count
+                    if isinstance(state.get("runtime_inputs"), dict):
+                        state["runtime_inputs"]["idempotency_key"] = f"speech-{row['task_id']}-r{fence_retry_count}"
+                    state.pop("submit_dispatched", None)
+                    state.pop("runtime_task_id", None)
+                    state.pop("gpu_execution_finished", None)
+                    state.pop("gpu_reclaim_proof", None)
+                    row["phase"] = (
+                        "reference"
+                        if isinstance(state.get("profile"), dict) and isinstance(state["profile"].get("reference"), dict)
+                        else "submit"
+                    )
+                    await self._release_scheduler_lease(row, reason="submit_stale_fencing_token")
+                    raise Failure("stale_fencing_token", 409, True) from exc
+                if (
+                    exc.code == "dependency_not_found"
+                    and isinstance(state.get("profile"), dict)
+                    and isinstance(state["profile"].get("reference"), dict)
+                    and int(state.get("ref_reupload_count") or 0) < 3
+                ):
+                    state["ref_reupload_count"] = int(state.get("ref_reupload_count") or 0) + 1
+                    state.pop("submit_dispatched", None)
+                    state.pop("runtime_task_id", None)
+                    row["phase"] = "reference"
+                    raise Failure("dependency_not_found", 404, True) from exc
+                raise
             validate("id", task.get("task_id"))
             state["runtime_task_id"] = task["task_id"]
             await self.save(row, phase="inference", delay=2)
@@ -868,6 +945,25 @@ class Worker:
                     await self._release_scheduler_lease(row, reason=f"inference_{task['status']}")
             if task["status"] == "failed":
                 code = task.get("error", {}).get("code")
+                if (
+                    code == "stale_fencing_token"
+                    and not task.get("outputs")
+                    and isinstance(state.get("runtime_inputs"), dict)
+                    and int(state.get("fence_retry_count") or 0) < 5
+                ):
+                    fence_retry_count = int(state.get("fence_retry_count") or 0) + 1
+                    state["fence_retry_count"] = fence_retry_count
+                    state["runtime_inputs"]["idempotency_key"] = f"speech-{row['task_id']}-r{fence_retry_count}"
+                    state.pop("submit_dispatched", None)
+                    state.pop("runtime_task_id", None)
+                    state.pop("gpu_execution_finished", None)
+                    state.pop("gpu_reclaim_proof", None)
+                    row["phase"] = (
+                        "reference"
+                        if isinstance(state.get("profile"), dict) and isinstance(state["profile"].get("reference"), dict)
+                        else "submit"
+                    )
+                    raise Failure("stale_fencing_token", 409, True)
                 raise Failure(
                     code if code in ("recovery_required", "model_version_changed", "stale_fencing_token") else "inference_failed",
                     409,

@@ -24,7 +24,7 @@ from test_speech import MemoryStore, fixture
 
 class SpeechT22LeaseAndTimingsTest(unittest.IsolatedAsyncioTestCase):
     async def test_scheduler_enabled_disables_legacy_k8s_lease_and_warns_once(self) -> None:
-        self.assertEqual(__version__, "0.2.12")
+        self.assertEqual(__version__, "0.2.13")
         env = {
             "STATION_GPU_SCHEDULER_URL": "http://station-runtime:5056",
             "STATION_GPU_SCHEDULER_TOKEN": "s" * 36,
@@ -67,7 +67,7 @@ class SpeechT22LeaseAndTimingsTest(unittest.IsolatedAsyncioTestCase):
         # Cold-start speech.create succeeds when scaled to 0 without touching runtime or K8s Leases
         created = await svc.call("speech.create", req, p)
         self.assertEqual(created["status"], "pending")
-        self.assertEqual(created["service_version"], "0.2.12")
+        self.assertEqual(created["service_version"], "0.2.13")
         rt_info = await svc.engine_runtime_info(p)
         self.assertEqual(rt_info["reason"], "scaled_to_zero")
         self.assertTrue(rt_info["layers"]["orchestration_alive"])
@@ -886,6 +886,82 @@ class SpeechT22LeaseAndTimingsTest(unittest.IsolatedAsyncioTestCase):
         await w._acquire_scheduler_grant(row_other)
         self.assertEqual(len(acquire_calls), 1)
         self.assertEqual(row_other["state"]["gpu_scheduler_lease"]["state"], "leased")
+
+    async def test_preinference_stale_fencing_token_auto_retries_and_requeues_on_startup(self) -> None:
+        p, req, row = fixture()
+        row = copy.deepcopy(row)
+        row["status"] = "failed"
+        row["phase"] = "inference"
+        row["last_error"] = "stale_fencing_token"
+        row["state"]["outputs"] = []
+        row["state"]["submit_dispatched"] = True
+        row["state"]["runtime_task_id"] = new_id()
+        row["state"]["runtime_inputs"] = {
+            "idempotency_key": "speech-" + row["task_id"],
+            "text": "你好",
+            "language": "zh-CN",
+            "reference_sha256": "a" * 64,
+        }
+        store = MemoryStore(row)
+        sched = SimpleNamespace(
+            enabled=True,
+            flush_pending_releases=lambda **_: 0,
+            list_own_leases=lambda: [],
+            acquire=lambda **_: {"lease_id": "lease-fresh-1", "fencing_token": 999, "state": "leased", "version": 1},
+            heartbeat=lambda lid, tok: {"lease_id": lid, "fencing_token": tok, "state": "running", "version": 2},
+            release=lambda *args, **kwargs: {"state": "released"},
+            build_grant_headers=lambda lease, **_: {"X-VF-GPU-Fencing-Token": "999"},
+        )
+        runtime_posts: list[dict] = []
+
+        async def runtime_json(principal, method, path, payload=None, **kwargs):
+            if path == "/v1/capabilities":
+                return {"model_manifest_sha256": row["state"]["profile"]["model_manifest_sha256"], "ready": True}
+            if method == "PUT" and path.startswith("/v1/references/"):
+                return {"ok": True}
+            if method == "POST" and path == "/v1/tasks":
+                runtime_posts.append(dict(payload))
+                if len(runtime_posts) == 1:
+                    raise Failure("stale_fencing_token", 409)
+                return {"task_id": new_id(), "status": "pending"}
+            raise AssertionError(f"unexpected {method} {path}")
+
+        ref_bytes = b"ref-bytes"
+        row["state"]["profile"]["reference"]["sha256"] = digest(ref_bytes)
+        peers = SimpleNamespace(
+            open=AsyncMock(),
+            content=AsyncMock(return_value=(ref_bytes, {"mime": "audio/wav"})),
+            runtime=SimpleNamespace(json=AsyncMock(side_effect=runtime_json)),
+        )
+        gpu = SimpleNamespace(enabled=False, scale_enabled=False, queue_seconds=60)
+        with patch("threading.Thread"):
+            w = Worker(SimpleNamespace(store=store, peers=peers, gpu=gpu, scheduler=sched))
+        w._ensure_gpu = AsyncMock()
+
+        await w.reconcile_startup_leases()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["phase"], "reference")
+        self.assertIsNone(row["last_error"])
+        self.assertEqual(row["state"]["fence_retry_count"], 1)
+        self.assertNotIn("runtime_task_id", row["state"])
+        self.assertNotIn("submit_dispatched", row["state"])
+
+        # Step reference -> submit with -r1 idempotency suffix
+        await w.process(row)
+        self.assertEqual(row["phase"], "submit")
+        self.assertEqual(row["state"]["runtime_inputs"]["idempotency_key"], f"speech-{row['task_id']}-r1")
+
+        # First POST /v1/tasks hits 409 stale_fencing_token -> retryable reset to reference with -r2
+        await w.process(row)
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["phase"], "reference")
+        self.assertEqual(row["state"]["fence_retry_count"], 2)
+
+        # Next reference -> submit succeeds with -r2
+        await w.process(row)
+        await w.process(row)
+        self.assertEqual(row["phase"], "inference")
+        self.assertEqual(runtime_posts[-1]["idempotency_key"], f"speech-{row['task_id']}-r2")
 
 
 if __name__ == "__main__":
