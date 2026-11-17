@@ -87,15 +87,10 @@ def _is_complete_warm_proof(proof: object, lease_id: str) -> bool:
 
 
 def _has_custom_attr(obj: object, attr: str) -> bool:
-    if isinstance(obj, Client):
-        return hasattr(obj, attr)
-    inst_dict = getattr(obj, "__dict__", None)
-    if isinstance(inst_dict, dict) and attr in inst_dict:
-        return True
-    cls_dict = getattr(type(obj), "__dict__", None)
-    if isinstance(cls_dict, dict) and attr in cls_dict:
-        return True
-    return False
+    if type(obj).__module__.startswith("unittest.mock"):
+        inst_dict = getattr(obj, "__dict__", None)
+        return isinstance(inst_dict, dict) and attr in inst_dict
+    return hasattr(obj, attr)
 
 
 class Worker:
