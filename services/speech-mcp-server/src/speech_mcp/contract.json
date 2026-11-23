@@ -89,7 +89,10 @@
           "maxLength": 128
         },
         "engine": {
-          "const": "indextts2"
+          "enum": [
+            "indextts2",
+            "cosyvoice3"
+          ]
         },
         "model_manifest_sha256": {
           "$ref": "#/$defs/hash"
@@ -230,8 +233,20 @@
           "minLength": 1,
           "maxLength": 500
         },
+        "engine": {
+          "enum": [
+            "indextts2",
+            "cosyvoice3"
+          ]
+        },
         "language": {
-          "const": "zh-CN"
+          "enum": [
+            "zh-CN",
+            "yue-HK",
+            "ja-JP",
+            "ko-KR",
+            "en-US"
+          ]
         },
         "emotion_vector": {
           "$ref": "#/$defs/emotion_vector"
@@ -387,7 +402,13 @@
           "type": "array",
           "minItems": 1,
           "items": {
-            "const": "zh-CN"
+            "enum": [
+              "zh-CN",
+              "yue-HK",
+              "ja-JP",
+              "ko-KR",
+              "en-US"
+            ]
           }
         },
         "max_text_chars": {
@@ -1259,7 +1280,13 @@
           "maxLength": 128
         },
         "language": {
-          "const": "zh-CN"
+          "enum": [
+            "zh-CN",
+            "yue-HK",
+            "ja-JP",
+            "ko-KR",
+            "en-US"
+          ]
         },
         "reference": {
           "type": "object",

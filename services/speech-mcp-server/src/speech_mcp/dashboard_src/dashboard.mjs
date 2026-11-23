@@ -404,23 +404,39 @@ function renderModelsAndMcp() {
       ? "按需唤醒 · 缩容待命"
       : "离线 · 待唤醒";
     const engineId = eng.engine || "indextts2";
-    const title = engineId === "indextts2" ? "IndexTTS2" : engineId;
+    const isCosy = engineId === "cosyvoice3";
+    const title =
+      engineId === "indextts2"
+        ? "IndexTTS2"
+        : isCosy
+        ? "Fun-CosyVoice3 0.5B-2512"
+        : engineId;
     return {
       id: engineId,
-      mark: engineId === "indextts2" ? "IX" : String(engineId).slice(0, 2).toUpperCase(),
+      mark: engineId === "indextts2" ? "IX" : isCosy ? "CV" : String(engineId).slice(0, 2).toUpperCase(),
       title,
       badge: badgeText,
-      caps: [
-        ["CLONE", "参考声线克隆"],
-        ["EMO-V", "8 维情感向量"],
-        ["EMO-T", "情感文字解析"],
-        ["EMO-A", "情感参考音频"],
-        ["ZH", "zh-CN"],
-      ],
+      caps: isCosy
+        ? [
+            ["CLONE", "零样本多语声线克隆"],
+            ["EMO-T", "指令/语气文字控制"],
+            ["MULTI", "zh-CN / yue-HK / ja-JP / ko-KR / en-US"],
+          ]
+        : [
+            ["CLONE", "参考声线克隆"],
+            ["EMO-V", "8 维情感向量"],
+            ["EMO-T", "情感文字解析"],
+            ["EMO-A", "情感参考音频"],
+            ["ZH", "zh-CN"],
+          ],
       quota: `参考音频 1 段 · ${eng.reference_audio?.min_seconds || 3}–${eng.reference_audio?.max_seconds || 15}s · 单声道 16–48kHz｜台词 1–${eng.max_text_chars || 300} 字`,
       unsupported: "精确时长、语速、取消、非语言音（喘息 / 哭声 / 笑声）、流式输出",
-      desc: `固定源码与全部权重 SHA-256（${String(eng.model_manifest_sha256 || "0".repeat(64)).slice(0, 12)}…），离线加载；需空闲显存 ≥18GiB，经 GPU Lease 排队。内置 Faster-Whisper Small 后置 ASR 复核（写入 report.json 的 transcript_check）。`,
-      foot: ["22.05kHz 原生", "48kHz/24bit 剪辑副本", "report.json (transcript_check)", "WAV"],
+      desc: isCosy
+        ? `FunAudioLLM/Fun-CosyVoice3-0.5B-2512（Apache-2.0），固定权重 SHA-256（${String(eng.model_manifest_sha256 || "0".repeat(64)).slice(0, 12)}…），作为按需唤醒的 Job/Worker Service 运行于 5090 dev（经 :5056 GPU Lease 调度，0<->1 按需缩放）。原生支持普通话、粤语、日语、韩语、英语五语零样本克隆与多语种 Whisper Small ASR 复核。`
+        : `固定源码与全部权重 SHA-256（${String(eng.model_manifest_sha256 || "0".repeat(64)).slice(0, 12)}…），离线加载；需空闲显存 ≥18GiB，经 GPU Lease 排队。内置 Faster-Whisper Small 后置 ASR 复核（写入 report.json 的 transcript_check）。`,
+      foot: isCosy
+        ? ["24kHz 原生", "48kHz/24bit 剪辑副本 (-16 LUFS)", "多语种 Whisper Small ASR", "WAV"]
+        : ["22.05kHz 原生", "48kHz/24bit 剪辑副本", "report.json (transcript_check)", "WAV"],
     };
   });
 

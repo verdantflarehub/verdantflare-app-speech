@@ -24,7 +24,7 @@ from test_speech import MemoryStore, fixture
 
 class SpeechT22LeaseAndTimingsTest(unittest.IsolatedAsyncioTestCase):
     async def test_scheduler_enabled_disables_legacy_k8s_lease_and_warns_once(self) -> None:
-        self.assertEqual(__version__, "0.2.14")
+        self.assertEqual(__version__, "0.2.15")
         env = {
             "STATION_GPU_SCHEDULER_URL": "http://station-runtime:5056",
             "STATION_GPU_SCHEDULER_TOKEN": "s" * 36,
@@ -67,7 +67,7 @@ class SpeechT22LeaseAndTimingsTest(unittest.IsolatedAsyncioTestCase):
         # Cold-start speech.create succeeds when scaled to 0 without touching runtime or K8s Leases
         created = await svc.call("speech.create", req, p)
         self.assertEqual(created["status"], "pending")
-        self.assertEqual(created["service_version"], "0.2.14")
+        self.assertEqual(created["service_version"], "0.2.15")
         rt_info = await svc.engine_runtime_info(p)
         self.assertEqual(rt_info["reason"], "scaled_to_zero")
         self.assertTrue(rt_info["layers"]["orchestration_alive"])

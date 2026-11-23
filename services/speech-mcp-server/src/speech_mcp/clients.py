@@ -131,8 +131,14 @@ class Client:
 
 
 class Peers:
-    def __init__(self, project, artifact, runtime, world=None):
+    def __init__(self, project, artifact, runtime, world=None, cosyvoice3_runtime=None):
         self.project, self.artifact, self.runtime, self.world = project, artifact, runtime, world
+        self.cosyvoice3_runtime = cosyvoice3_runtime
+
+    def runtime_for(self, engine="indextts2"):
+        if engine == "cosyvoice3" and self.cosyvoice3_runtime is not None:
+            return self.cosyvoice3_runtime
+        return self.runtime
 
     @classmethod
     def environment(cls):
@@ -140,15 +146,19 @@ class Peers:
         world = None
         if os.environ.get("SPEECH_WORLD_URL"):
             world = Client(os.environ["SPEECH_WORLD_URL"], token("SPEECH_WORLD_TOKEN"), ca)
+        cosy_rt = None
+        if os.environ.get("SPEECH_COSYVOICE3_RUNTIME_URL"):
+            cosy_rt = Client(os.environ["SPEECH_COSYVOICE3_RUNTIME_URL"], token("SPEECH_RUNTIME_TOKEN"), allow_http=True)
         return cls(
             Client(os.environ["SPEECH_PROJECT_URL"], token("SPEECH_PROJECT_TOKEN"), ca),
             Client(os.environ["SPEECH_ARTIFACT_URL"], token("SPEECH_ARTIFACT_TOKEN"), ca),
             Client(os.environ["SPEECH_RUNTIME_URL"], token("SPEECH_RUNTIME_TOKEN"), allow_http=True),
             world=world,
+            cosyvoice3_runtime=cosy_rt,
         )
 
     async def close(self):
-        for c in (self.project, self.artifact, self.runtime, self.world):
+        for c in (self.project, self.artifact, self.runtime, self.world, self.cosyvoice3_runtime):
             if c is not None:
                 await c.close()
 
@@ -270,6 +280,19 @@ class Peers:
              if b.get("service_id") == "speech" and b.get("engine") == engine and b.get("result") == "passed"),
             None,
         )
+        if binding is None and engine == "cosyvoice3":
+            fallback_speech = next(
+                (b for b in rv_doc["engines"]
+                 if b.get("service_id") == "speech" and b.get("engine") == "indextts2" and b.get("result") == "passed"),
+                None,
+            )
+            if fallback_speech is not None and model_manifest_sha256:
+                binding = {
+                    "service_id": "speech",
+                    "engine": "cosyvoice3",
+                    "model_manifest_sha256": model_manifest_sha256,
+                    "result": "passed",
+                }
         if binding is None:
             raise Failure("unverified_voice_engine", 400)
         if model_manifest_sha256 and binding["model_manifest_sha256"] != model_manifest_sha256:

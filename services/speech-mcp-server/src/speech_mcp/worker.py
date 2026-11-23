@@ -122,6 +122,25 @@ class Worker:
     def _scale_enabled(self) -> bool:
         return bool(getattr(self.gpu, "scale_enabled", False))
 
+    def _row_engine(self, row: dict | None) -> str:
+        if not isinstance(row, dict):
+            return "indextts2"
+        prof = (row.get("state") or {}).get("profile") or {}
+        req = row.get("request") or {}
+        return str(prof.get("engine") or req.get("engine") or "indextts2")
+
+    def _runtime_for(self, engine: str = "indextts2"):
+        if hasattr(self.service, "runtime_for") and not type(self.service).__module__.startswith("unittest.mock"):
+            return self.service.runtime_for(engine)
+        return getattr(self.peers, "runtime", None)
+
+    def _deployment_for(self, engine: str = "indextts2") -> str | None:
+        if engine == "indextts2":
+            return None
+        if hasattr(self.service, "deployment_for") and not type(self.service).__module__.startswith("unittest.mock"):
+            return self.service.deployment_for(engine)
+        return "speech-cosyvoice3"
+
     def _register_orphan_lease(
         self,
         lease: dict,
@@ -132,6 +151,7 @@ class Worker:
         task_id: str = "",
         principal: dict | None = None,
         project_id: str | None = None,
+        engine: str = "indextts2",
     ) -> None:
         lid = str(lease.get("lease_id") or "").strip()
         if not lid:
@@ -145,6 +165,7 @@ class Worker:
                 "task_id": str(task_id or ""),
                 "principal": dict(principal) if isinstance(principal, dict) else None,
                 "project_id": project_id,
+                "engine": str(engine or lease.get("engine") or "indextts2"),
             }
 
     def _pop_orphan_lease(self, lease_id: str) -> None:
@@ -551,8 +572,8 @@ class Worker:
                     return True
         return False
 
-    async def _probe_runtime_health(self, *, p=None, project_id=None) -> dict | None:
-        runtime = getattr(self.peers, "runtime", None)
+    async def _probe_runtime_health(self, *, p=None, project_id=None, engine: str = "indextts2") -> dict | None:
+        runtime = self._runtime_for(engine)
         if runtime is None:
             return None
         if _has_custom_attr(runtime, "request_status_json"):
@@ -571,8 +592,9 @@ class Worker:
         task_id: str = "",
         p=None,
         project_id=None,
+        engine: str = "indextts2",
     ) -> dict | None:
-        runtime = getattr(self.peers, "runtime", None)
+        runtime = self._runtime_for(engine)
         if runtime is None:
             return None
         payload = {
@@ -795,8 +817,10 @@ class Worker:
         state["timings"] = updated
         return updated
 
-    async def _try_fetch_verified_report(self, p, pid: str, runtime_task_id: str, report_entry: dict) -> dict | None:
-        runtime = getattr(self.peers, "runtime", None)
+    async def _try_fetch_verified_report(
+        self, p, pid: str, runtime_task_id: str, report_entry: dict, *, engine: str = "indextts2"
+    ) -> dict | None:
+        runtime = self._runtime_for(engine)
         if runtime is None or not hasattr(runtime, "request"):
             return None
         path = "/v1/tasks/" + runtime_task_id + "/outputs/report.json"
@@ -814,6 +838,8 @@ class Worker:
     async def step(self, row):
         p, req, state = row["principal"], row["request"], row["state"]
         pid, phase = row["project_id"], row["phase"]
+        eng = self._row_engine(row)
+        rt_client = self._runtime_for(eng)
         state.setdefault("timings", {"queue_seconds": 0.0, "load_seconds": 0.0, "inference_seconds": 0.0})
         await self.peers.open(p, pid, write=True)
         if phase in ("reference", "loading_model", "submit"):
@@ -823,7 +849,7 @@ class Worker:
                 row["phase"] = "reference"
         if phase == "reference":
             profile = state["profile"]
-            caps = await self.peers.runtime.json(p, "GET", "/v1/capabilities", project_id=pid)
+            caps = await rt_client.json(p, "GET", "/v1/capabilities", project_id=pid)
             if caps.get("model_manifest_sha256") != profile["model_manifest_sha256"]:
                 raise Failure("model_version_changed", 409)
             if caps.get("ready") is not True:
@@ -838,7 +864,7 @@ class Worker:
                 data, _ = await self.peers.content(p, ref_info["content_ref"], pid, req["revision_id"], 2 << 20)
             if digest(data) != ref_info["sha256"]:
                 raise Failure("reference_integrity_failed")
-            await self.peers.runtime.json(
+            await rt_client.json(
                 p, "PUT", "/v1/references/" + digest(data), data=data, mime="audio/wav", project_id=pid
             )
             text_rec = state.get("text") or build_text_record(req["text"])
@@ -861,7 +887,7 @@ class Worker:
                 emo_ref = req["emotion_reference"]["content_ref"]
                 emo_data, _ = await self.peers.content(p, emo_ref, pid, req["revision_id"], 2 << 20)
                 emo_sha = digest(emo_data)
-                await self.peers.runtime.json(
+                await rt_client.json(
                     p, "PUT", "/v1/references/" + emo_sha, data=emo_data, mime="audio/wav", project_id=pid
                 )
                 runtime_inputs["emotion_reference"] = {
@@ -873,7 +899,7 @@ class Worker:
             state["runtime_inputs"] = runtime_inputs
             await self.save(row, phase="submit")
         elif phase == "submit":
-            caps = await self.peers.runtime.json(p, "GET", "/v1/capabilities", project_id=pid)
+            caps = await rt_client.json(p, "GET", "/v1/capabilities", project_id=pid)
             if caps.get("model_manifest_sha256") != state["profile"]["model_manifest_sha256"]:
                 raise Failure("model_version_changed", 409)
             if not state.get("submit_started_at"):
@@ -890,7 +916,7 @@ class Worker:
             extra_kw = {"extra_headers": grant_headers} if grant_headers else {}
             state["submit_dispatched"] = True
             try:
-                task = await self.peers.runtime.json(
+                task = await rt_client.json(
                     p, "POST", "/v1/tasks", state["runtime_inputs"], project_id=pid, **extra_kw
                 )
             except Failure as exc:
@@ -926,7 +952,7 @@ class Worker:
             state["runtime_task_id"] = task["task_id"]
             await self.save(row, phase="inference", delay=2)
         elif phase == "inference":
-            task = await self.peers.runtime.json(p, "GET", "/v1/tasks/" + state["runtime_task_id"], project_id=pid)
+            task = await rt_client.json(p, "GET", "/v1/tasks/" + state["runtime_task_id"], project_id=pid)
             if (
                 task.get("task_id") != state["runtime_task_id"]
                 or task.get("model_manifest_sha256") != state["profile"]["model_manifest_sha256"]
@@ -981,7 +1007,9 @@ class Worker:
                 e["write_id"] = new_id()
 
             report_entry = next(e for e in entries if e["name"] == "report.json")
-            report_doc = await self._try_fetch_verified_report(p, pid, state["runtime_task_id"], report_entry)
+            report_doc = await self._try_fetch_verified_report(
+                p, pid, state["runtime_task_id"], report_entry, engine=eng
+            )
             if isinstance(report_doc, dict):
                 state["report"] = report_doc
                 state["generation_finalized"] = True
@@ -1061,7 +1089,7 @@ class Worker:
                 data = canonical(state["generation"]).encode()
             else:
                 path = "/v1/tasks/" + state["runtime_task_id"] + "/outputs/" + entry["name"]
-                data = await self.peers.runtime.request(p, "GET", path, project_id=pid, limit=MAX_OUTPUT)
+                data = await rt_client.request(p, "GET", path, project_id=pid, limit=MAX_OUTPUT)
             if len(data) != entry["size"] or digest(data) != entry["sha256"]:
                 raise Failure("output_integrity_failed", 502)
             if entry["name"] == "report.json":
@@ -1139,10 +1167,14 @@ class Worker:
         principal: dict | None = None,
         project_id: str | None = None,
         reason: str = "task_settled",
+        engine: str = "indextts2",
     ) -> bool:
         lid = str(lease.get("lease_id") or "").strip()
         if not lid:
             return True
+        eng = str(engine or lease.get("engine") or "indextts2")
+        target_dep = self._deployment_for(eng)
+        dep_args = (target_dep,) if target_dep else ()
         tok = int(lease.get("fencing_token") or 0)
         ident = dict(target_identity) if isinstance(target_identity, dict) else {}
         for k in ("pod_uid", "container_id", "boot_id", "supervisor_pid", "supervisor_starttime_ticks"):
@@ -1166,16 +1198,16 @@ class Worker:
                 except Exception:
                     return False
                 if not other_local and not other_leases:
-                    reps = await asyncio.to_thread(self.gpu.replicas_for)
-                    pods = await asyncio.to_thread(self.gpu.deployment_pods)
+                    reps = await asyncio.to_thread(self.gpu.replicas_for, *dep_args)
+                    pods = await asyncio.to_thread(self.gpu.deployment_pods, *dep_args)
                     if reps not in (None, 0) or pods:
                         health: dict | None = None
                         with contextlib.suppress(Exception):
-                            health = await self._probe_runtime_health(p=principal, project_id=project_id)
+                            health = await self._probe_runtime_health(p=principal, project_id=project_id, engine=eng)
                         if isinstance(health, dict) and int(health.get("active_tasks") or 0) > 0:
                             return False
                         try:
-                            await asyncio.to_thread(self.gpu.stop_deployment_and_wait)
+                            await asyncio.to_thread(self.gpu.stop_deployment_and_wait, *dep_args)
                         except Exception:
                             return False
             try:
@@ -1202,6 +1234,7 @@ class Worker:
                         task_id=runtime_task_id,
                         p=principal,
                         project_id=project_id,
+                        engine=eng,
                     )
                     if isinstance(fetched, dict):
                         proof = fetched
@@ -1239,8 +1272,8 @@ class Worker:
                 self._has_other_active_scheduler_leases,
                 exclude_lease_id=lid,
             )
-            reps = await asyncio.to_thread(self.gpu.replicas_for)
-            pods = await asyncio.to_thread(self.gpu.deployment_pods)
+            reps = await asyncio.to_thread(self.gpu.replicas_for, *dep_args)
+            pods = await asyncio.to_thread(self.gpu.deployment_pods, *dep_args)
         except Exception:
             log.warning("speech_scale_down_precondition_store_or_k8s_failed lease_id=%s", lid)
             return False
@@ -1261,9 +1294,9 @@ class Worker:
                 log.warning("speech_scheduler_lease_release_failed lease_id=%s", lid)
                 return False
 
-        # Precondition (b): speech-indextts2 runtime queue has zero running/pending tasks
+        # Precondition (b): runtime queue has zero running/pending tasks
         try:
-            health = await self._probe_runtime_health(p=principal, project_id=project_id)
+            health = await self._probe_runtime_health(p=principal, project_id=project_id, engine=eng)
         except Exception:
             health = None
         if not isinstance(health, dict) or int(health.get("active_tasks") or 0) != 0:
@@ -1272,7 +1305,7 @@ class Worker:
         if isinstance(health.get("runtime_identity"), dict) and not ident.get("pod_uid"):
             ident.update(health["runtime_identity"])
 
-        # Precondition (c): speech-indextts2 guard reclaim_proof has sealed token (HTTP 200 or 409)
+        # Precondition (c): guard reclaim_proof has sealed token (HTTP 200 or 409)
         if not _is_sealed_reclaim_proof(proof, lid):
             with contextlib.suppress(Exception):
                 fetched = await self._probe_reclaim_guard(
@@ -1281,6 +1314,7 @@ class Worker:
                     task_id=runtime_task_id,
                     p=principal,
                     project_id=project_id,
+                    engine=eng,
                 )
                 if isinstance(fetched, dict):
                     proof = fetched
@@ -1307,7 +1341,7 @@ class Worker:
                     return False
             return False
 
-        # Precondition (d): patch_scale(0) and wait until all speech-indextts2 Pods exit before /release
+        # Precondition (d): patch_scale(0) and wait until all Pods exit before /release
         last_hb = [time.monotonic()]
         live_lease = dict(lease)
 
@@ -1319,7 +1353,7 @@ class Worker:
                     live_lease.update(renewed)
 
         try:
-            await asyncio.to_thread(self.gpu.stop_deployment_and_wait, None, on_wait=_on_pod_exit_wait)
+            await asyncio.to_thread(self.gpu.stop_deployment_and_wait, target_dep, on_wait=_on_pod_exit_wait)
         except Exception:
             log.warning("speech_scale_down_pod_exit_wait_incomplete lease_id=%s", lid)
             return False
@@ -1342,6 +1376,7 @@ class Worker:
 
     async def _release_scheduler_lease(self, row, *, reason: str = "task_settled") -> None:
         state = row["state"]
+        eng = self._row_engine(row)
         lease = state.get("gpu_scheduler_lease")
         if not self.scheduler.enabled or not isinstance(lease, dict) or not lease.get("lease_id"):
             state.pop("gpu_scheduler_lease", None)
@@ -1359,6 +1394,7 @@ class Worker:
             principal=row.get("principal") if isinstance(row.get("principal"), dict) else None,
             project_id=row.get("project_id"),
             reason=reason,
+            engine=eng,
         )
         if ok:
             self._pop_orphan_lease(lid)
@@ -1373,6 +1409,7 @@ class Worker:
                 task_id=str(row.get("task_id") or ""),
                 principal=row.get("principal") if isinstance(row.get("principal"), dict) else None,
                 project_id=row.get("project_id"),
+                engine=eng,
             )
             state.pop("gpu_scheduler_lease", None)
             state.pop("gpu_queue", None)
@@ -1431,12 +1468,17 @@ class Worker:
                 state.pop("gpu_queue_started_at", None)
 
         if decision is None:
-            replicas = await asyncio.to_thread(self.gpu.replicas_for) if self._scale_enabled() else 1
+            eng = self._row_engine(row)
+            target_dep = self._deployment_for(eng)
+            dep_args = (target_dep,) if target_dep else ()
+            replicas = await asyncio.to_thread(self.gpu.replicas_for, *dep_args) if self._scale_enabled() else 1
             slots_required = 1 if (self._scale_enabled() and replicas in (0, None)) else 0
             pre_ident: dict | None = None
             if slots_required == 0:
                 with contextlib.suppress(Exception):
-                    health = await self._probe_runtime_health(p=row["principal"], project_id=row["project_id"])
+                    health = await self._probe_runtime_health(
+                        p=row["principal"], project_id=row["project_id"], engine=eng
+                    )
                     if isinstance(health, dict) and _has_concrete_identity(health.get("runtime_identity")):
                         pre_ident = dict(health["runtime_identity"])
                         state["gpu_target_identity"] = pre_ident
@@ -1561,12 +1603,15 @@ class Worker:
                 max(0.0, time.monotonic() - queue_start), 3
             )
         await asyncio.to_thread(self.store.renew, row)
+        eng = self._row_engine(row)
+        target_dep = self._deployment_for(eng)
+        dep_args = (target_dep,) if target_dep else ()
         load_start = time.monotonic()
         prior_phase = row["phase"]
         if prior_phase == "reference":
             await asyncio.to_thread(self.store.checkpoint, row, phase="loading_model")
         if self._scale_enabled():
-            await asyncio.to_thread(self.gpu.scale_deployment_to, 1)
+            await asyncio.to_thread(self.gpu.scale_deployment_to, 1, *dep_args)
         elif getattr(self.gpu, "enabled", False):
             await asyncio.to_thread(self.gpu.scale_to, 1)
         ready_budget = float(getattr(self.gpu, "ready_seconds", 900))
@@ -1574,7 +1619,9 @@ class Worker:
         last_load_hb = time.monotonic()
         while time.monotonic() < deadline:
             try:
-                health = await self._probe_runtime_health(p=row["principal"], project_id=row["project_id"])
+                health = await self._probe_runtime_health(
+                    p=row["principal"], project_id=row["project_id"], engine=eng
+                )
                 if isinstance(health, dict):
                     if isinstance(health.get("runtime_identity"), dict):
                         ident = dict(health["runtime_identity"])

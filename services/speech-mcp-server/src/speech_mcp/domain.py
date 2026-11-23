@@ -75,6 +75,11 @@ def validate(kind, value):
             raise Failure("invalid_emotion_vector")
         if "emotion_text" in value and not value["emotion_text"].strip():
             raise Failure("invalid_arguments")
+        eng = value.get("engine") or "indextts2"
+        if eng == "indextts2" and value.get("language") != "zh-CN":
+            raise Failure("invalid_arguments")
+        if eng == "cosyvoice3" and any(k in value for k in ("emotion_vector", "emotion_reference")):
+            raise Failure("invalid_arguments")
     return value
 
 
@@ -130,6 +135,10 @@ def compute_input_digest(sent_text, voice_source, model_manifest_sha256, req):
         "model_manifest_sha256": model_manifest_sha256,
         "emotion": emotion,
     }
+    if req.get("engine") and req["engine"] != "indextts2":
+        payload["engine"] = req["engine"]
+    if req.get("language") and req["language"] != "zh-CN":
+        payload["language"] = req["language"]
     return digest(canonical(payload).encode())
 
 
@@ -197,6 +206,38 @@ class IndexTTS2Adapter(EngineAdapter):
 DEFAULT_ADAPTER = IndexTTS2Adapter()
 
 
+class CosyVoice3Adapter(EngineAdapter):
+    engine_id = "cosyvoice3"
+    languages = ["zh-CN", "yue-HK", "ja-JP", "ko-KR", "en-US"]
+    emotion_inputs = ["emotion_text"]
+    unsupported = ["exact_duration", "speed", "cancel", "non_verbal", "streaming"]
+
+    def capability(self, ready_runtime=None, model_manifest_sha256=None):
+        is_ready = bool(ready_runtime and ready_runtime.get("ready"))
+        manifest_hash = (ready_runtime or {}).get("model_manifest_sha256") or model_manifest_sha256 or ("0" * 64)
+        max_chars = int((ready_runtime or {}).get("max_text_chars", 300))
+        ref_audio = (ready_runtime or {}).get("reference_audio") or {
+            "min_seconds": 3,
+            "max_seconds": 15,
+            "max_bytes": 10485760,
+            "sample_rates_hz": [16000, 22050, 24000, 44100, 48000],
+            "channels": 1,
+        }
+        return {
+            "engine": self.engine_id,
+            "ready": is_ready,
+            "model_manifest_sha256": manifest_hash,
+            "languages": list(self.languages),
+            "max_text_chars": max_chars,
+            "reference_audio": ref_audio,
+            "emotion_inputs": list(self.emotion_inputs),
+            "unsupported": list(self.unsupported),
+        }
+
+
+COSYVOICE3_ADAPTER = CosyVoice3Adapter()
+
+
 
 def principal(value):
     keys = {"organization_id", "subject_id", "request_id"}
@@ -212,7 +253,7 @@ def scope(p, project_id):
 DESCRIPTIONS = {
     "capabilities": "Discover registered self-hosted speech engines and their per-engine capabilities.",
     "voices": "List World reference-voice assets and project candidate voice profiles in a readable project revision.",
-    "create": "Generate one Chinese dialogue or narration take using a pinned World reference voice or project voice profile.",
+    "create": "Generate one speech dialogue or narration take (Chinese Mandarin, Cantonese, Japanese, Korean, or English) using a pinned World reference voice or project voice profile.",
     "status": "Recover the original speech task, phase, timings, and review state. Do not resubmit inference after an archive failure.",
     "result": "Return central Artifact ContentRefs for a completed speech take. Download through artifact.read and explicitly archive in the same Project.",
     "list": "List speech tasks for the caller (NSFW items are unconditionally excluded from MCP responses).",

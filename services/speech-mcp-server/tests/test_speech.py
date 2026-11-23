@@ -632,5 +632,39 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(Failure, "unverified_voice_engine"):
             await peers.world_voice(self.p, opened, {"asset_id": aid, "version_id": vid}, engine="indextts2")
 
+        # 4. CosyVoice3 reuses verified speech reference voice with cosyvoice3 model hash
+        peers.asset_content = fake_asset_content
+        cosy_prof, cosy_vs, _ = await peers.world_voice(
+            self.p, opened, {"asset_id": aid, "version_id": vid}, engine="cosyvoice3", model_manifest_sha256="e" * 64
+        )
+        self.assertEqual(cosy_prof["engine"], "cosyvoice3")
+        self.assertEqual(cosy_prof["model_manifest_sha256"], "e" * 64)
+        self.assertEqual(cosy_vs["kind"], "world")
+
+    async def test_cosyvoice3_multi_engine_capabilities_and_multilingual_create(self):
+        cosy_rt = AsyncMock()
+        cosy_rt.json.return_value = {"ready": True, "model_manifest_sha256": "e" * 64}
+        self.peers.cosyvoice3_runtime = cosy_rt
+        svc = Service(self.store, self.peers, "a" * 64, cosyvoice3_model_hash="e" * 64)
+        caps = await svc.call("speech.capabilities", {}, self.p)
+        validate("capabilities_result", caps)
+        self.assertEqual([e["engine"] for e in caps["engines"]], ["indextts2", "cosyvoice3"])
+        self.assertEqual(caps["engines"][1]["languages"], ["zh-CN", "yue-HK", "ja-JP", "ko-KR", "en-US"])
+
+        for lang, text in [
+            ("yue-HK", "多谢大家！"),
+            ("ja-JP", "ありがとうございました！"),
+            ("ko-KR", "감사합니다!"),
+            ("en-US", "Thank you all!"),
+            ("zh-CN", "谢谢大家！"),
+        ]:
+            self.store.prior = None
+            req_cosy = self.req | {"engine": "cosyvoice3", "language": lang, "text": text, "idempotency_key": f"cosy-{lang}"}
+            validate("create", req_cosy)
+            res = await svc.call("speech.create", req_cosy, self.p)
+            self.assertEqual(res["status"], "pending")
+            self.assertEqual(self.store.row["state"]["profile"]["engine"], "cosyvoice3")
+            self.assertEqual(self.store.row["state"]["profile"]["model_manifest_sha256"], "e" * 64)
+
 
 if __name__ == "__main__": unittest.main()

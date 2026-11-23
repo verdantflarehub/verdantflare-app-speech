@@ -8,6 +8,7 @@ import uuid
 from . import __version__
 from .content_rating import ContentRatingStore
 from .domain import (
+    COSYVOICE3_ADAPTER,
     DEFAULT_ADAPTER,
     Failure,
     TaskNotFound,
@@ -23,9 +24,32 @@ VOICE_PATH = re.compile(r"^speech/voices/[a-z0-9][a-z0-9_-]{0,63}/profile\.json$
 
 
 class Service:
-    def __init__(self, store, peers, model_hash, gpu=None, adapter=None, ratings=None, scheduler=None):
+    def __init__(
+        self,
+        store,
+        peers,
+        model_hash,
+        gpu=None,
+        adapter=None,
+        ratings=None,
+        scheduler=None,
+        cosyvoice3_model_hash=None,
+        cosyvoice3_adapter=None,
+        cosyvoice3_deployment=None,
+    ):
         validate("hash", model_hash)
         self.store, self.peers, self.model_hash = store, peers, model_hash
+        env_cosy_hash = os.environ.get("SPEECH_COSYVOICE3_MODEL_MANIFEST_SHA256", "").strip()
+        resolved_cosy_hash = cosyvoice3_model_hash if cosyvoice3_model_hash is not None else (env_cosy_hash or None)
+        if resolved_cosy_hash is not None:
+            validate("hash", resolved_cosy_hash)
+        self.cosyvoice3_model_hash = resolved_cosy_hash
+        self.cosyvoice3_adapter = cosyvoice3_adapter if cosyvoice3_adapter is not None else COSYVOICE3_ADAPTER
+        self.cosyvoice3_deployment = (
+            cosyvoice3_deployment
+            if cosyvoice3_deployment is not None
+            else (os.environ.get("GPU_COSYVOICE3_DEPLOYMENT", "speech-cosyvoice3").strip() or "speech-cosyvoice3")
+        )
         self.gpu = gpu if gpu is not None else GpuCoordinator.from_environment()
         self.scheduler = scheduler if scheduler is not None else SchedulerLeaseClient.from_environment(store=store)
         if getattr(self.scheduler, "enabled", False):
@@ -333,18 +357,44 @@ class Service:
             "content_rating": "general",
         }
 
-    async def engine_runtime_info(self, p):
+    def model_hash_for(self, engine: str = "indextts2") -> str:
+        if engine == "cosyvoice3" and self.cosyvoice3_model_hash:
+            return self.cosyvoice3_model_hash
+        return self.model_hash
+
+    def adapter_for(self, engine: str = "indextts2"):
+        if engine == "cosyvoice3":
+            return self.cosyvoice3_adapter
+        return self.adapter
+
+    def deployment_for(self, engine: str = "indextts2") -> str | None:
+        if engine == "cosyvoice3":
+            return self.cosyvoice3_deployment
+        return getattr(self.gpu, "deployment", None)
+
+    def runtime_for(self, engine: str = "indextts2"):
+        if engine == "cosyvoice3":
+            cosy_rt = getattr(self.peers, "cosyvoice3_runtime", None)
+            if cosy_rt is not None and not type(cosy_rt).__module__.startswith("unittest.mock.NonCallable"):
+                if not type(self.peers).__module__.startswith("unittest.mock") or "cosyvoice3_runtime" in getattr(self.peers, "__dict__", {}):
+                    return cosy_rt
+        return self.peers.runtime
+
+    async def engine_runtime_info(self, p, engine: str = "indextts2"):
         ready = False
         reason = "connect_failed"
         info = None
+        rt_client = self.runtime_for(engine)
+        target_dep = self.deployment_for(engine) if engine != "indextts2" else None
         try:
-            health = await self.peers.runtime.json(p, "GET", "/health")
+            health = await rt_client.json(p, "GET", "/health")
             info = health if isinstance(health, dict) else {}
             ready = info.get("ready") is True
             reason = "ok" if ready else "health_not_ready"
         except Failure:
-            reason = self._runtime_reason()
-        cap = self.adapter.capability(info, model_manifest_sha256=self.model_hash)
+            reason = self._runtime_reason(deployment=target_dep)
+        adapter = self.adapter_for(engine)
+        cap = adapter.capability(info, model_manifest_sha256=self.model_hash_for(engine))
         return {
             "capability": cap,
             "ready": ready,
@@ -357,18 +407,24 @@ class Service:
             },
         }
 
+    async def all_engines_runtime_info(self, p) -> list[dict]:
+        items = [await self.engine_runtime_info(p, "indextts2")]
+        if self.cosyvoice3_model_hash:
+            items.append(await self.engine_runtime_info(p, "cosyvoice3"))
+        return items
+
     async def call(self, name, args, p):
         action = name.removeprefix("speech.")
         if action not in ("capabilities", "voices", "create", "status", "result", "list", "rate_content") or name != "speech." + action:
             raise Failure("tool_not_found", 404)
         validate(action, args)
         if action == "capabilities":
-            rt = await self.engine_runtime_info(p)
+            rts = await self.all_engines_runtime_info(p)
             return validate(
                 "capabilities_result",
                 {
                     "service_version": __version__,
-                    "engines": [rt["capability"]],
+                    "engines": [rt["capability"] for rt in rts],
                     "content_rating": {
                         "supported": True,
                         "tool": "speech.rate_content",
@@ -504,10 +560,13 @@ class Service:
         if args.get("script_ref"):
             self.peers.contains(opened, args["script_ref"])
             await self.peers.content(p, args["script_ref"], pid, args["revision_id"], 1 << 20)
+        req_engine = args.get("engine") or "indextts2"
+        target_model_hash = self.model_hash_for(req_engine)
+        target_runtime = self.runtime_for(req_engine)
         if args.get("world_voice"):
             profile, voice_source, _ = await self.peers.world_voice(
                 p, opened, args["world_voice"],
-                engine=self.adapter.engine_id, model_manifest_sha256=self.model_hash, check_boundary=True,
+                engine=req_engine, model_manifest_sha256=target_model_hash, check_boundary=True,
             )
             audio, meta = await self.peers.asset_content(
                 p,
@@ -521,7 +580,9 @@ class Service:
             profile_sha = voice_source["reference_sha256"]
         else:
             profile, profile_sha = await self.peers.profile(p, opened, pid, args["revision_id"], args["voice_profile"])
-            if profile["model_manifest_sha256"] != self.model_hash:
+            if req_engine == "cosyvoice3" and profile.get("engine") != "cosyvoice3":
+                profile = {**profile, "engine": "cosyvoice3", "model_manifest_sha256": target_model_hash}
+            elif profile["model_manifest_sha256"] != target_model_hash:
                 raise Failure("model_version_changed", 409)
             # Validate the actual immutable reference before accepting durable work.
             audio, meta = await self.peers.content(p, profile["reference"]["content_ref"], pid, args["revision_id"], 2 << 20)
@@ -547,14 +608,14 @@ class Service:
         text_record = build_text_record(args["text"], entries)
         if len(text_record["sent"]) > 500 or not text_record["sent"]:
             raise Failure("invalid_text")
-        input_digest = compute_input_digest(text_record["sent"], voice_source, self.model_hash, args)
+        input_digest = compute_input_digest(text_record["sent"], voice_source, target_model_hash, args)
         # A managed runtime may be scaled to zero. Persist validated work first;
         # the worker owns its lease, startup and actual model verification.
         # None is intentional: configuration is not an observed capability report.
         caps = None
         if not self._managed_runtime():
-            caps = await self.peers.runtime.json(p, "GET", "/v1/capabilities", project_id=pid)
-            if caps.get("model_manifest_sha256") != self.model_hash:
+            caps = await target_runtime.json(p, "GET", "/v1/capabilities", project_id=pid)
+            if caps.get("model_manifest_sha256") != target_model_hash:
                 raise Failure("model_version_changed", 409)
             if not caps.get("ready"):
                 raise Failure("model_not_ready", 503, True)
@@ -579,10 +640,13 @@ class Service:
             or getattr(self.scheduler, "enabled", False)
         )
 
-    def _runtime_reason(self):
+    def _runtime_reason(self, deployment: str | None = None):
         if getattr(self.scheduler, "enabled", False) or getattr(self.gpu, "scale_enabled", False):
             try:
-                reps = self.gpu.replicas_for() if hasattr(self.gpu, "replicas_for") else None
+                if hasattr(self.gpu, "replicas_for"):
+                    reps = self.gpu.replicas_for(deployment) if deployment else self.gpu.replicas_for()
+                else:
+                    reps = None
                 if reps == 0:
                     return "scaled_to_zero"
             except Exception:

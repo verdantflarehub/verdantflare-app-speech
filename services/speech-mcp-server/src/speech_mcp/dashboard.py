@@ -146,7 +146,8 @@ class DashboardAPI:
             )
             for r in rows
         ]
-        rt = await self.service.engine_runtime_info(p)
+        rts = await self.service.all_engines_runtime_info(p)
+        rt = rts[0]
         kpis = {
             "total_tasks": len(summaries),
             "succeeded_tasks": sum(1 for s in summaries if s["status"] == "succeeded"),
@@ -164,7 +165,7 @@ class DashboardAPI:
             "service_version": __version__,
             "kpis": kpis,
             "engine": rt,
-            "engines": [rt["capability"]],
+            "engines": [x["capability"] for x in rts],
             "tools": TOOLS,
             "filters": {"projects": projects, "characters": characters},
             "recent_tasks": summaries[:500],
@@ -318,12 +319,13 @@ class DashboardAPI:
         )
         generation = state.get("generation")
         staleness = {"stale": False, "reasons": [], "input_digest": state.get("input_digest")}
+        row_engine = (state.get("profile") or {}).get("engine") or req.get("engine") or "indextts2"
         if isinstance(generation, dict):
             staleness = check_take_staleness(
                 generation,
                 voice_source,
                 current_sent_text=(state.get("text") or {}).get("sent"),
-                current_model_manifest_sha256=self.service.model_hash,
+                current_model_manifest_sha256=self.service.model_hash_for(row_engine),
             )
         head_revision_id = (
             opened.get("head_revision_id")
@@ -456,11 +458,13 @@ class DashboardAPI:
         return await self.task_detail(p, task_id, include_nsfw=True)
 
     async def models(self, p):
-        rt = await self.service.engine_runtime_info(p)
+        rts = await self.service.all_engines_runtime_info(p)
+        rt = rts[0]
         return {
             "service_version": __version__,
-            "engines": [rt["capability"]],
+            "engines": [x["capability"] for x in rts],
             "runtime": rt,
+            "runtimes": rts,
         }
 
     async def mcp_status(self, p):
